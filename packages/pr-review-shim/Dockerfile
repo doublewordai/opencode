@@ -17,6 +17,7 @@ ARG TARGETARCH
 
 RUN apk add --no-cache \
       ca-certificates \
+      curl \
       git \
       github-cli \
       libgcc \
@@ -50,8 +51,9 @@ RUN if [ "${TARGETARCH}" = "amd64" ]; then \
 COPY opencode.json /app/opencode.json
 COPY docs/doubleword.md /app/docs/doubleword.md
 
-# Sanity check both binaries during build.
-RUN opencode --version && pr-review-shim --help 2>&1 | head -1 || true
+# Sanity check the opencode binary during build. The shim has no --help flag
+# (it only handles webhook POSTs), so verifying it loads is left to runtime.
+RUN opencode --version
 
 COPY packages/pr-review-shim/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
