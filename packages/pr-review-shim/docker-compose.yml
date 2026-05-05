@@ -31,6 +31,7 @@ services:
       - "14123"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "-u", "opencode:${OPENCODE_SERVER_PASSWORD}", "http://localhost:14123/api/session?limit=1"]
+    # Note: shim healthcheck is on /health (not /healthz — Cloud Run reserves /healthz).
       interval: 10s
       timeout: 5s
       retries: 3

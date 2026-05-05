@@ -94,8 +94,26 @@ This section is the load-bearing payload of the experiment. Every piece of frict
 - **Webhook delivery infrastructure.** To get notified of new PRs, the customer must run a publicly routable HTTPS endpoint that GitHub can reach, with HMAC-verified signature handling. We're using Cloud Run for that here. A platform-side tool loop wouldn't require the customer to deploy anything to receive triggers.
 - **Per-PR working-directory lifecycle.** opencode supports per-request directories via `x-opencode-directory`, so we don't need a container per PR — but we still have to clone each PR's branch into a temp dir, manage cleanup, and serialize the side-effects (`bash` exec on file system, `gh` CLI calls). All of that is client-side bookkeeping that a hosted execution layer would handle once.
 - **Tool-binary distribution.** The agent's `bash` tool needs `git` and `gh` available in the runtime image. Bundling these is straightforward in alpine but a customer must own the supply chain (CVE patching, version pinning, image rebuilds) for every tool the agent uses. Server-side tools centralise that responsibility.
+- **Cloud-side IAM gymnastics for public ingress.** Webhooks are unauthenticated POSTs by protocol — receiving them requires a publicly invokable HTTPS endpoint. On Cloud Run, exposing the service to `allUsers` requires `run.services.setIamPolicy`, which most engineers won't have on a SOC 2-scoped project. Resolving this required pulling in someone with project IAM admin to make a one-line change. A platform-side tool loop wouldn't impose this on the customer at all — the inbound trigger is internal to Doubleword's infrastructure.
+- **Compliance posture proxying.** Even with the right infra controls in place (HMAC-validated webhook, dedicated service account, bounded resources, AR vulnerability scanning), the *act of deploying* a public webhook receiver into a SOC 2-scoped project pushed change-management considerations onto the customer that wouldn't exist at all if the agent ran on Doubleword. Customers building agentic products today inherit our security posture *and* their own.
 
 (Phases 2–4 will append their own friction findings to this section.)
+
+## Deployed compliance posture (phase 1)
+
+Recorded for audit trail. The phase-1 Cloud Run service `pr-review-harness` in `tech-426212/europe-west4` was deployed with:
+
+- **Dedicated service account** `pr-review-harness@tech-426212.iam.gserviceaccount.com` (not the default compute SA), no IAM bindings beyond what Cloud Run requires for its own runtime
+- **Public ingress** with `allUsers/run.invoker` — granted via change-managed action by an IAM admin. The compensating control is application-level HMAC-SHA256 verification on the only public endpoint (`/webhook`)
+- **Resource bounds** — `min-instances=1 max-instances=1 cpu=2 memory=2Gi`, single-instance for predictable behaviour and bounded blast radius
+- **TLS** — terminated at the Cloud Run frontend on `*.run.app` (mandatory)
+- **Image** — pulled from a private Artifact Registry repo (`pr-review-harness/harness:phase-1`) with vulnerability scanning enabled
+- **Container** — alpine-minimal, single process tree under `tini`, runs `pr-review-shim` which self-supervises `opencode-server` as a child
+- **Logging** — Cloud Logging captures stdout/stderr; retention follows the `_Default` log bucket policy at the project level
+- **Secrets** — phase 1 carries the few config secrets (`DOUBLEWORD_API_KEY`, `GITHUB_TOKEN`, `GITHUB_WEBHOOK_SECRET`, `OPENCODE_SERVER_PASSWORD`) as Cloud Run env vars rather than Secret Manager references. This was a controlled trade-off because the project's IAM policy required project-IAM-admin to grant the service account access to Secret Manager; for a short-lived experiment with rotatable keys this was acceptable. **Production deployments must move to Secret Manager.**
+- **No persistent state** — sessions and PR review state live in-memory on the single instance; opencode SQLite migrations run on startup against `/var/...` ephemeral container storage
+
+The full source for this deployment is in the `experiment/phase-1-sync-provider` branch of the [doublewordai/opencode fork](https://github.com/doublewordai/opencode/tree/experiment/phase-1-sync-provider).
 
 ## What this phase tests
 
