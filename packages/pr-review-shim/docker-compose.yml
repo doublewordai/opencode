@@ -24,7 +24,7 @@ services:
     expose:
       - "14123"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:14123/api/session", "--user", "opencode", "--password", "${OPENCODE_SERVER_PASSWORD}"]
+      test: ["CMD", "curl", "-fsS", "-u", "opencode:${OPENCODE_SERVER_PASSWORD}", "http://localhost:14123/api/session?limit=1"]
       interval: 10s
       timeout: 5s
       retries: 3
