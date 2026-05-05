@@ -16,17 +16,22 @@
 #   docker build --platform linux/amd64 -f packages/pr-review-shim/Dockerfile \
 #     -t pr-review-harness .
 
-FROM alpine
+# Pin alpine version explicitly for reproducibility + auditable supply chain.
+# `gh` CLI is intentionally not installed — the shim posts reviews via
+# @octokit/rest (in-process) and clones via git with the installation token
+# in the URL, so the gh binary would only be dead weight (and was the source
+# of all 15 vulnerabilities in the first build).
+FROM alpine:3.23
 
 RUN apk add --no-cache \
       ca-certificates \
       curl \
       git \
-      github-cli \
       libgcc \
       libstdc++ \
       ripgrep \
-      tini
+      tini \
+  && apk upgrade --no-cache
 
 WORKDIR /app
 
