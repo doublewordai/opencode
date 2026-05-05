@@ -84,6 +84,19 @@ opencode run --agent review --model doubleword/Qwen/Qwen3.5-397B-A17B-FP8 \
 
 (Replace `opencode run` with whatever the appropriate non-interactive entry point is — see [COR-364](https://linear.app/doubleword/issue/COR-364) for the harness work that wraps this.)
 
+## Production friction observed (running tally)
+
+This section is the load-bearing payload of the experiment. Every piece of friction recorded here is something that *only exists because tool execution lives client-side*. A Doubleword-hosted server-side tool loop ([Multi-Tier Agentic Tools](https://linear.app/doubleword/project/multi-tier-agentic-tools-70de986f3f32)) could in principle ship `github_review_pr` as a hosted capability with most of this concealed inside the platform.
+
+### Phase 1 (sync baseline)
+
+- **Bot identity setup.** Posting a review as a recognisable PR participant requires a separate bot identity — either a fresh GitHub user account that gets added as a collaborator (pollutes the org's user roster) or a GitHub App with private-key auth + installation tokens (correct pattern, but requires creating an App, generating a key, installing it on each repo, and refreshing short-lived installation tokens in code). Both flows exist *only because* the agent is hosted by us, not by GitHub. A platform tool wouldn't need any of this — Doubleword could broker the GitHub identity centrally.
+- **Webhook delivery infrastructure.** To get notified of new PRs, the customer must run a publicly routable HTTPS endpoint that GitHub can reach, with HMAC-verified signature handling. We're using Cloud Run for that here. A platform-side tool loop wouldn't require the customer to deploy anything to receive triggers.
+- **Per-PR working-directory lifecycle.** opencode supports per-request directories via `x-opencode-directory`, so we don't need a container per PR — but we still have to clone each PR's branch into a temp dir, manage cleanup, and serialize the side-effects (`bash` exec on file system, `gh` CLI calls). All of that is client-side bookkeeping that a hosted execution layer would handle once.
+- **Tool-binary distribution.** The agent's `bash` tool needs `git` and `gh` available in the runtime image. Bundling these is straightforward in alpine but a customer must own the supply chain (CVE patching, version pinning, image rebuilds) for every tool the agent uses. Server-side tools centralise that responsibility.
+
+(Phases 2–4 will append their own friction findings to this section.)
+
 ## What this phase tests
 
 Sync chat-completions against Doubleword. Establishes the baseline for the four-way comparison:
