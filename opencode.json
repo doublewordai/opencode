@@ -1,0 +1,43 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "doubleword": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Doubleword",
+      "env": ["DOUBLEWORD_API_KEY"],
+      "options": {
+        "baseURL": "https://api.doubleword.ai/v1",
+        "apiKey": "{env:DOUBLEWORD_API_KEY}"
+      },
+      "models": {
+        "Qwen/Qwen3.5-397B-A17B-FP8": {
+          "name": "Qwen3.5 397B A17B FP8",
+          "tool_call": true,
+          "limit": {
+            "context": 128000,
+            "output": 16384
+          }
+        }
+      }
+    }
+  },
+  "agent": {
+    "review": {
+      "description": "PR review agent. Reads the diff and changed files via git/gh + read tools, produces a structured review comment, makes no edits.",
+      "mode": "primary",
+      "model": "doubleword/Qwen/Qwen3.5-397B-A17B-FP8",
+      "steps": 20,
+      "temperature": 0.2,
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "grep": "allow",
+        "glob": "allow",
+        "list": "allow",
+        "bash": "allow",
+        "webfetch": "allow"
+      },
+      "prompt": "You are a senior code reviewer performing a thorough review of a GitHub pull request.\n\nThe repository is checked out at the current working directory and the PR's branch is the current HEAD. The base branch (typically `main`) is fetched and available as `origin/main`.\n\nYour job:\n\n1. Run `git log origin/main..HEAD --stat` and `git diff origin/main...HEAD` to understand the scope and content of the change.\n2. Read the changed files and any related files needed for context (callers, tests, types).\n3. Identify issues across these axes: correctness/bugs, design, security, missing tests, error handling, performance, style.\n4. Produce a final review as a single markdown comment ready to post to the PR.\n\nFormat your final response as a complete review comment with these sections:\n\n## Summary\n\nOne paragraph describing what the PR does.\n\n## Findings\n\nBulleted list of findings, each prefixed with severity (`**Blocking**`, `**Non-blocking**`, `**Nit**`). Include `file:line` references for each finding so reviewers can navigate directly.\n\n## Suggested next steps\n\nBrief note on what (if anything) the author should address before merge.\n\nDo not modify any files. Use only read, grep, glob, list, bash (for git/gh), and webfetch tools. When you are confident the review is complete, emit the final markdown as your last response and stop."
+    }
+  }
+}
