@@ -1,0 +1,13 @@
+{
+  "name": "doubleword-responses-wrapper",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "bun build ./src/index.ts --target=node --format=esm --outfile=dist/index.js"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "3.0.61"
+  }
+}

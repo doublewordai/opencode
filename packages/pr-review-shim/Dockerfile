@@ -45,6 +45,13 @@ COPY packages/pr-review-shim/dist/pr-review-shim-linux-x64-musl/bin/pr-review-sh
 COPY opencode.json /app/opencode.json
 COPY docs/doubleword.md /app/docs/doubleword.md
 
+# Phase-3: pre-built single-file ESM bundle of @ai-sdk/openai with a
+# fetch wrapper that injects service_tier=flex into POST /v1/responses
+# bodies and exposes provider.responses(modelId) under languageModel(modelId).
+# opencode.json's provider.doubleword.npm points at this file via file://
+# so the dynamic-import path skips Npm.add and loads it directly.
+COPY packages/doubleword-responses-wrapper/dist/index.js /app/doubleword-responses-wrapper/index.js
+
 # Sanity check binaries during build — fail-fast if either is broken.
 RUN opencode --version
 
