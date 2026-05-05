@@ -27,7 +27,6 @@ const env = {
   REVIEW_AGENT: process.env.REVIEW_AGENT ?? "review",
   REVIEW_MODEL_PROVIDER: process.env.REVIEW_MODEL_PROVIDER ?? "doubleword",
   REVIEW_MODEL_ID: process.env.REVIEW_MODEL_ID ?? "Qwen/Qwen3.5-397B-A17B-FP8",
-  BASE_BRANCH: process.env.BASE_BRANCH ?? "main",
 }
 
 function requireEnv(name: string): string {
@@ -162,14 +161,13 @@ async function runReviewSession(input: {
   prNumber: number
   baseBranch: string
 }): Promise<string | null> {
+  // Sessions are bare; agent + model are bound per-message via the v1
+  // /session/:id/message endpoint, which returns the assistant message
+  // synchronously with all its parts attached.
   const session = await opencode<{ id: string }>("/session", {
     method: "POST",
     directory: input.directory,
-    body: {
-      title: `PR #${input.prNumber} review`,
-      agent: env.REVIEW_AGENT,
-      model: { providerID: env.REVIEW_MODEL_PROVIDER, id: env.REVIEW_MODEL_ID },
-    },
+    body: { title: `PR #${input.prNumber} review` },
   })
 
   const promptText = [
@@ -178,30 +176,20 @@ async function runReviewSession(input: {
     `Run \`git log ${input.baseBranch}..HEAD --stat\` and \`git diff ${input.baseBranch}...HEAD\` to find the change set, read relevant files for context, and produce a complete review comment as your final response per your system instructions.`,
   ].join("\n\n")
 
-  await opencode(`/api/session/${session.id}/prompt`, {
-    method: "POST",
-    directory: input.directory,
-    body: { prompt: { text: promptText } },
-  })
-  await opencode(`/api/session/${session.id}/wait`, {
-    method: "POST",
-    directory: input.directory,
-    body: {},
-    expect: 204,
-  })
-
-  const messages = await opencode<{ items: Array<{ role: string; parts: Array<{ type: string; text?: string }> }> }>(
-    `/api/session/${session.id}/message`,
-    { method: "GET", directory: input.directory },
+  const reply = await opencode<{ parts: Array<{ type: string; text?: string }> }>(
+    `/session/${session.id}/message`,
+    {
+      method: "POST",
+      directory: input.directory,
+      body: {
+        agent: env.REVIEW_AGENT,
+        model: { providerID: env.REVIEW_MODEL_PROVIDER, modelID: env.REVIEW_MODEL_ID },
+        parts: [{ type: "text", text: promptText }],
+      },
+    },
   )
 
-  for (let i = messages.items.length - 1; i >= 0; i--) {
-    const msg = messages.items[i]
-    if (!msg || msg.role !== "assistant") continue
-    const text = [...msg.parts].reverse().find((p) => p.type === "text")?.text
-    if (text) return text
-  }
-  return null
+  return [...reply.parts].reverse().find((p) => p.type === "text")?.text ?? null
 }
 
 async function opencode<T = unknown>(
