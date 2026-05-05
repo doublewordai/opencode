@@ -270,6 +270,18 @@ This section is the load-bearing payload of the experiment. Every piece of frict
 - **Cloud-side IAM gymnastics for public ingress.** Webhooks are unauthenticated POSTs by protocol — receiving them requires a publicly invokable HTTPS endpoint. On Cloud Run, exposing the service to `allUsers` requires `run.services.setIamPolicy`, which most engineers won't have on a SOC 2-scoped project. Resolving this required pulling in someone with project IAM admin to make a one-line change. A platform-side tool loop wouldn't impose this on the customer at all — the inbound trigger is internal to Doubleword's infrastructure.
 - **Compliance posture proxying.** Even with the right infra controls in place (HMAC-validated webhook, dedicated service account, bounded resources, AR vulnerability scanning), the *act of deploying* a public webhook receiver into a SOC 2-scoped project pushed change-management considerations onto the customer that wouldn't exist at all if the agent ran on Doubleword. Customers building agentic products today inherit our security posture *and* their own.
 
+### Phase 2 (autobatcher / `createDoublewordAsync`) — design-level friction
+
+> **Status: implementation complete on `experiment/phase-2-autobatcher`, deploy pending.** Skeleton recorded here while the experiment is queued; benchmark and scoring numbers go in once the dogfood test runs.
+
+- **opencode's bundled-provider registry doesn't recognise `@doubleword/vercel-ai`.** opencode's provider loader (`packages/opencode/src/provider/provider.ts`, `BUNDLED_PROVIDERS` map at lines 92–117) hardcodes the factory function name for every known npm provider package. For unknown packages the fallback (lines 1529–1550) does `mod[Object.keys(mod).find((key) => key.startsWith("create"))!]` — i.e., it picks the first export whose name starts with `create`. `@doubleword/vercel-ai`'s barrel exports `createDoubleword` (sync chat-completions) before `createDoublewordAsync` (autobatcher), so the fallback would silently pick the *wrong* factory and we'd be re-running phase 1 thinking we were running phase 2. Workaround: ship a single-file ESM bundle that re-exports `createDoublewordAsync as createDoubleword`, so the only "create*"-prefixed key is unambiguously the autobatcher (`packages/doubleword-async-wrapper/`). Whole module exists only because opencode has no config-level factory selector. Recordable platform friction — a customer pulling Doubleword's official Vercel provider into their existing opencode-shaped agent harness would walk straight into this.
+- **No local Docker / no buildx on the dogfood box.** Phase 1's runbook is `docker buildx build → docker push → gcloud run services update`. The build/deploy host for phase 2 had no Docker, no Podman, and no passwordless sudo to install one. We swapped to Cloud Build (`gcloud builds submit --tag <ar-image>`) — same image artifact, build runs remotely on GCP. Different from phase 1's pipeline, recordable as deploy-pipeline friction in its own right: changing the *inference path* shouldn't normally also force a deploy-tooling change, but in a customer-runs-everything model the two are coupled because the customer's infra constrains both.
+- **Cloud Build requires interactive `gcloud auth login` before any non-interactive deploy step can run.** Cloud Run/AR pushes are user-credential gated and there's no service-account JSON cached on the dogfood box. A platform-side hosted tool loop wouldn't impose a per-customer GCP-auth lifecycle on the inference-path migration.
+
+### Phase 2 — implementation friction (TBD after dogfood)
+
+To be filled in after the deploy + retrigger of PR #1047. Watch in particular for: parallel-tool-call batch-window stalls, dropped requests under load, streaming-buffer mismatches between the autobatcher's response shape and what opencode's agent loop expects, error surfaces that differ from the realtime tier.
+
 ### Phase 1 (sync baseline) — implementation friction surfaced by the dogfood test
 
 These are first-time-only mistakes, but each is a representative customer footgun:
@@ -305,12 +317,14 @@ The full source for this deployment is in the `experiment/phase-1-sync-provider`
 
 Phases progressively change *only* the inference path. The harness (shim + opencode + GitHub App + Cloud Run service) stays the same.
 
-| Phase | Inference path | Hypothesis under test | Linear |
-|---|---|---|---|
-| 1 (this) | Sync chat-completions, realtime tier | Baseline | [COR-364](https://linear.app/doubleword/issue/COR-364) ✅ Done |
-| 2 | `createDoublewordAsync` (autobatcher, flex tier, client-side batching) — from [vercel-doubleword](https://github.com/doublewordai/vercel-doubleword) | Client-side batching may be overwhelmed by parallel tool calls in opencode's loop | [COR-365](https://linear.app/doubleword/issue/COR-365) |
-| 3 | Open Responses API + `service_tier=flex` (long-held connection, no background) | Long-held HTTP connections may time out at intermediate proxies / load balancers | [COR-366](https://linear.app/doubleword/issue/COR-366) |
-| 4 | Open Responses API + `service_tier=flex` + `background=true` (poll) | Polling resolves both phase-2 and phase-3 failure modes; agent loop must restructure for non-blocking inference | [COR-367](https://linear.app/doubleword/issue/COR-367) |
+| Phase | Inference path | Hypothesis under test | Branch | Linear |
+|---|---|---|---|---|
+| 1 (this) | Sync chat-completions, realtime tier | Baseline | `experiment/phase-1-sync-provider` | [COR-364](https://linear.app/doubleword/issue/COR-364) ✅ Done |
+| 2 | `createDoublewordAsync` (autobatcher, flex tier, client-side batching) — from [vercel-doubleword](https://github.com/doublewordai/vercel-doubleword) | Client-side batching may be overwhelmed by parallel tool calls in opencode's loop | `experiment/phase-2-autobatcher` | [COR-365](https://linear.app/doubleword/issue/COR-365) |
+| 3 | Open Responses API + `service_tier=flex` (long-held connection, no background) | Long-held HTTP connections may time out at intermediate proxies / load balancers | `experiment/phase-3-responses-flex` | [COR-366](https://linear.app/doubleword/issue/COR-366) |
+| 4 | Open Responses API + `service_tier=flex` + `background=true` (poll) | Polling resolves both phase-2 and phase-3 failure modes; agent loop must restructure for non-blocking inference | `experiment/phase-4-responses-flex-bg` | [COR-367](https://linear.app/doubleword/issue/COR-367) |
+
+A parallel variant — `experiment/deeper-loop` (off phase 1) — explores the orthogonal axis of "research-heavy prompt + 100-step cap". See `docs/doubleword-deeper-loop.md`.
 
 For each subsequent phase: branch from `experiment/phase-1-sync-provider`, swap out the provider configuration in `opencode.json`, redeploy, retrigger PR #1047, score the resulting review against ground truth, append the phase's findings to this doc's friction tally + create a benchmark comparison row.
 
