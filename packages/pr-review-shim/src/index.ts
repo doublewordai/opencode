@@ -21,7 +21,7 @@
 
 import { createHmac, timingSafeEqual } from "node:crypto"
 import { spawn, type ChildProcess } from "node:child_process"
-import { mkdtemp, rm } from "node:fs/promises"
+import { copyFile, mkdtemp, rm } from "node:fs/promises"
 import path from "node:path"
 import os from "node:os"
 import { Octokit, type RestEndpointMethodTypes } from "@octokit/rest"
@@ -42,6 +42,11 @@ const env = {
   REVIEW_AGENT: process.env.REVIEW_AGENT ?? "review",
   REVIEW_MODEL_PROVIDER: process.env.REVIEW_MODEL_PROVIDER ?? "doubleword",
   REVIEW_MODEL_ID: process.env.REVIEW_MODEL_ID ?? "Qwen/Qwen3.5-397B-A17B-FP8",
+  // opencode loads agent + provider config from this file relative to the
+  // workspace directory (the x-opencode-directory header value). We copy this
+  // file into each cloned PR worktree so the `review` agent + Doubleword
+  // provider are available to that session.
+  OPENCODE_CONFIG_PATH: process.env.OPENCODE_CONFIG_PATH ?? "/app/opencode.json",
   WATCHED_REPOS: (process.env.WATCHED_REPOS ?? "")
     .split(",")
     .map((s) => s.trim())
@@ -254,7 +259,10 @@ async function listRecentPRs(
 
 async function runReview(input: ReviewInput, opencodeServerUrl: string, post: Poster): Promise<void> {
   const tag = tagOf(input)
-  const workdir = await mkdtemp(path.join(os.tmpdir(), `${tag}-`))
+  // mkdtemp won't create intermediate directories — sanitize slashes/anything
+  // non-alphanumeric to keep the path a single component.
+  const fsTag = tag.replace(/[^a-z0-9-]/gi, "-")
+  const workdir = await mkdtemp(path.join(os.tmpdir(), `${fsTag}-`))
   console.log(`[${tag}] starting review at ${workdir}`)
 
   try {
@@ -264,6 +272,8 @@ async function runReview(input: ReviewInput, opencodeServerUrl: string, post: Po
       baseRef: input.baseBranch,
       cwd: workdir,
     })
+    // Make the review agent + Doubleword provider visible to the session.
+    await copyFile(env.OPENCODE_CONFIG_PATH, path.join(workdir, "opencode.json"))
     const reviewText = await runReviewSession({ directory: workdir, opencodeServerUrl, ...input })
     if (!reviewText) {
       console.error(`[${tag}] no review text returned from opencode`)
@@ -316,8 +326,15 @@ async function authedCloneUrl(cloneUrl: string): Promise<string> {
 }
 
 async function cloneRepo(input: { cloneUrl: string; ref: string; baseRef: string; cwd: string }): Promise<void> {
-  await runCmd("git", ["clone", "--no-tags", "--depth=50", input.cloneUrl, "."], input.cwd)
-  await runCmd("git", ["fetch", "origin", `${input.baseRef}:${input.baseRef}`], input.cwd)
+  // Depth needs to be enough to reach the merge-base of HEAD and origin/<base>
+  // so the agent's `git diff origin/<base>...HEAD` resolves; 500 is generous
+  // for typical PR sizes without paying the cost of a full clone.
+  await runCmd("git", ["clone", "--no-tags", "--depth=500", input.cloneUrl, "."], input.cwd)
+  // No explicit dst (no `:<local>` refspec) — git refuses to fetch into a
+  // local branch that's currently checked out (which the cloned default
+  // branch always is). A bare `git fetch origin <ref>` updates the
+  // remote-tracking branch `origin/<ref>` and FETCH_HEAD, which is enough.
+  await runCmd("git", ["fetch", "origin", input.baseRef], input.cwd)
   await runCmd("git", ["fetch", "origin", input.ref], input.cwd)
   await runCmd("git", ["checkout", "FETCH_HEAD"], input.cwd)
 }
@@ -357,20 +374,23 @@ async function runReviewSession(input: {
     `Run \`git log ${input.baseBranch}..HEAD --stat\` and \`git diff ${input.baseBranch}...HEAD\` to find the change set, read relevant files for context, and produce a complete review comment as your final response per your system instructions.`,
   ].join("\n\n")
 
-  const reply = await opencode<{ parts: Array<{ type: string; text?: string }> }>(
-    input.opencodeServerUrl,
-    `/session/${session.id}/message`,
-    {
-      method: "POST",
-      directory: input.directory,
-      body: {
-        agent: env.REVIEW_AGENT,
-        model: { providerID: env.REVIEW_MODEL_PROVIDER, modelID: env.REVIEW_MODEL_ID },
-        parts: [{ type: "text", text: promptText }],
-      },
+  const reply = await opencode<{
+    parts?: Array<{ type: string; text?: string }>
+    success?: boolean
+    error?: unknown
+  }>(input.opencodeServerUrl, `/session/${session.id}/message`, {
+    method: "POST",
+    directory: input.directory,
+    body: {
+      agent: env.REVIEW_AGENT,
+      model: { providerID: env.REVIEW_MODEL_PROVIDER, modelID: env.REVIEW_MODEL_ID },
+      parts: [{ type: "text", text: promptText }],
     },
-  )
+  })
 
+  if (!reply.parts) {
+    throw new Error(`opencode session returned no parts; envelope: ${JSON.stringify(reply).slice(0, 500)}`)
+  }
   return [...reply.parts].reverse().find((p) => p.type === "text")?.text ?? null
 }
 
