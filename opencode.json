@@ -2,8 +2,8 @@
   "$schema": "https://opencode.ai/config.json",
   "provider": {
     "doubleword": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "Doubleword",
+      "npm": "file:///app/doubleword-responses-wrapper/index.js",
+      "name": "Doubleword (Responses API + flex)",
       "env": ["DOUBLEWORD_API_KEY"],
       "options": {
         "baseURL": "https://api.doubleword.ai/v1",
