@@ -1,32 +1,49 @@
 /**
- * PR review webhook shim for the COR-364 experiment harness.
+ * PR review harness for the COR-364 experiment.
  *
- * Receives a GitHub pull_request webhook, clones the PR branch into a temp
- * worktree, asks a long-running opencode server to run the `review` agent
- * against that worktree (via the `x-opencode-directory` header), then posts
- * the resulting review back to the PR as a comment.
+ * Two trigger paths feed one review pipeline:
  *
- * One opencode server, many concurrent reviews — see docs/doubleword.md for
- * the deployment shape and rationale.
+ *   1. Webhook    — POST /webhook from a GitHub pull_request event.
+ *                   Trusted (HMAC-verified). The review IS posted back to the PR.
+ *   2. Polling    — every POLL_INTERVAL_MS, list open PRs across WATCHED_REPOS
+ *                   created in the last POLL_INTERVAL_MS hours. Treated as
+ *                   read-only — the rendered review is logged to stdout, never
+ *                   posted. No persistent "seen" state; cron-style stateless.
+ *
+ * The pipeline (clone → opencode session → extract markdown) is shared. The
+ * post step is a callback so each path can attach its own behaviour.
+ *
+ * The shim self-supervises opencode-server as a child process when
+ * OPENCODE_SERVER_URL is unset (single-container Cloud Run pattern). When
+ * OPENCODE_SERVER_URL is set, the shim assumes an external server (local dev,
+ * docker-compose).
  */
 
 import { createHmac, timingSafeEqual } from "node:crypto"
-import { spawn } from "node:child_process"
+import { spawn, type ChildProcess } from "node:child_process"
 import { mkdtemp, rm } from "node:fs/promises"
 import path from "node:path"
 import os from "node:os"
-import { Octokit } from "@octokit/rest"
+import { Octokit, type RestEndpointMethodTypes } from "@octokit/rest"
+
+const DEFAULT_OPENCODE_PORT = 14123
 
 const env = {
   DOUBLEWORD_API_KEY: requireEnv("DOUBLEWORD_API_KEY"),
   GITHUB_TOKEN: requireEnv("GITHUB_TOKEN"),
   GITHUB_WEBHOOK_SECRET: requireEnv("GITHUB_WEBHOOK_SECRET"),
-  OPENCODE_SERVER_URL: process.env.OPENCODE_SERVER_URL ?? "http://localhost:14123",
   OPENCODE_SERVER_PASSWORD: requireEnv("OPENCODE_SERVER_PASSWORD"),
+  OPENCODE_SERVER_URL: process.env.OPENCODE_SERVER_URL,
+  OPENCODE_BIN: process.env.OPENCODE_BIN ?? "opencode",
   PORT: Number(process.env.PORT ?? 8080),
   REVIEW_AGENT: process.env.REVIEW_AGENT ?? "review",
   REVIEW_MODEL_PROVIDER: process.env.REVIEW_MODEL_PROVIDER ?? "doubleword",
   REVIEW_MODEL_ID: process.env.REVIEW_MODEL_ID ?? "Qwen/Qwen3.5-397B-A17B-FP8",
+  WATCHED_REPOS: (process.env.WATCHED_REPOS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+  POLL_INTERVAL_MS: Number(process.env.POLL_INTERVAL_MS ?? 24 * 60 * 60 * 1000),
 }
 
 function requireEnv(name: string): string {
@@ -39,47 +56,228 @@ function requireEnv(name: string): string {
 }
 
 const octokit = new Octokit({ auth: env.GITHUB_TOKEN })
-
-const opencodeAuthHeader = "Basic " + Buffer.from(`opencode:${env.OPENCODE_SERVER_PASSWORD}`).toString("base64")
+const opencodeAuth = "Basic " + Buffer.from(`opencode:${env.OPENCODE_SERVER_PASSWORD}`).toString("base64")
 
 type PullRequestEvent = {
   action: string
   pull_request: {
     number: number
-    head: { ref: string; sha: string; repo: { clone_url: string; full_name: string } }
+    head: { ref: string; sha: string }
     base: { ref: string }
     title: string
-    html_url: string
   }
-  repository: { full_name: string; clone_url: string; owner: { login: string }; name: string }
+  repository: { clone_url: string; owner: { login: string }; name: string }
 }
+
+type ReviewInput = {
+  owner: string
+  repo: string
+  prNumber: number
+  prTitle: string
+  baseBranch: string
+  headRef: string
+  cloneUrl: string
+}
+
+type Poster = (text: string) => Promise<void>
 
 const TRIGGER_ACTIONS = new Set(["opened", "synchronize", "reopened"])
 
-const server = Bun.serve({
-  port: env.PORT,
-  async fetch(req) {
-    const url = new URL(req.url)
-    if (url.pathname === "/healthz") return new Response("ok")
-    if (url.pathname !== "/webhook" || req.method !== "POST") return new Response("not found", { status: 404 })
+async function main() {
+  const opencodeServerUrl = await ensureOpencodeServer()
 
-    const body = await req.text()
-    const sigHeader = req.headers.get("x-hub-signature-256")
-    if (!sigHeader || !verifySignature(body, sigHeader)) return new Response("invalid signature", { status: 401 })
+  const server = Bun.serve({
+    port: env.PORT,
+    fetch: async (req) => handleHttp(req, opencodeServerUrl),
+  })
+  console.log(`pr-review-shim listening on http://localhost:${server.port}`)
 
-    const eventType = req.headers.get("x-github-event")
-    if (eventType !== "pull_request") return new Response("ignored", { status: 200 })
+  if (env.WATCHED_REPOS.length > 0) {
+    console.log(
+      `polling ${env.WATCHED_REPOS.length} repo(s) every ${env.POLL_INTERVAL_MS}ms: ${env.WATCHED_REPOS.join(", ")}`,
+    )
+    pollWatchedRepos(opencodeServerUrl).catch((err) => console.error("initial poll failed", err))
+    setInterval(() => {
+      pollWatchedRepos(opencodeServerUrl).catch((err) => console.error("scheduled poll failed", err))
+    }, env.POLL_INTERVAL_MS)
+  }
+}
 
-    const event = JSON.parse(body) as PullRequestEvent
-    if (!TRIGGER_ACTIONS.has(event.action)) return new Response("ignored", { status: 200 })
+async function ensureOpencodeServer(): Promise<string> {
+  if (env.OPENCODE_SERVER_URL) {
+    console.log(`using external opencode server at ${env.OPENCODE_SERVER_URL}`)
+    await waitForOpencodeReady(env.OPENCODE_SERVER_URL)
+    return env.OPENCODE_SERVER_URL
+  }
 
-    // Fire-and-forget — the webhook should return quickly so GitHub doesn't retry.
-    runReview(event).catch((err) => console.error("review failed", { pr: event.pull_request.number, err }))
-    return new Response("queued", { status: 202 })
-  },
-})
+  const url = `http://127.0.0.1:${DEFAULT_OPENCODE_PORT}`
+  console.log(`spawning opencode server: ${env.OPENCODE_BIN} serve --hostname 127.0.0.1 --port ${DEFAULT_OPENCODE_PORT}`)
 
-console.log(`pr-review-shim listening on http://localhost:${server.port}`)
+  const child = spawn(
+    env.OPENCODE_BIN,
+    ["serve", "--hostname", "127.0.0.1", "--port", String(DEFAULT_OPENCODE_PORT)],
+    {
+      stdio: "inherit",
+      env: { ...process.env, OPENCODE_SERVER_PASSWORD: env.OPENCODE_SERVER_PASSWORD },
+    },
+  )
+  child.on("exit", (code, signal) => {
+    console.error(`opencode server exited code=${code} signal=${signal} — aborting`)
+    process.exit(code ?? 1)
+  })
+  forwardSignals(child)
+  await waitForOpencodeReady(url)
+  console.log(`opencode server ready at ${url}`)
+  return url
+}
+
+function forwardSignals(child: ChildProcess) {
+  for (const sig of ["SIGTERM", "SIGINT"] as const) {
+    process.on(sig, () => child.kill(sig))
+  }
+}
+
+async function waitForOpencodeReady(url: string): Promise<void> {
+  const deadline = Date.now() + 60_000
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`${url}/api/session?limit=1`, { headers: { authorization: opencodeAuth } })
+      if (res.ok) return
+    } catch {
+      // server not up yet; retry
+    }
+    await new Promise((r) => setTimeout(r, 500))
+  }
+  throw new Error(`opencode server not ready at ${url} within 60s`)
+}
+
+async function handleHttp(req: Request, opencodeServerUrl: string): Promise<Response> {
+  const url = new URL(req.url)
+  if (url.pathname === "/healthz") return new Response("ok")
+  if (url.pathname !== "/webhook" || req.method !== "POST") return new Response("not found", { status: 404 })
+
+  const body = await req.text()
+  const sigHeader = req.headers.get("x-hub-signature-256")
+  if (!sigHeader || !verifySignature(body, sigHeader)) return new Response("invalid signature", { status: 401 })
+
+  const eventType = req.headers.get("x-github-event")
+  if (eventType !== "pull_request") return new Response("ignored", { status: 200 })
+
+  const event = JSON.parse(body) as PullRequestEvent
+  if (!TRIGGER_ACTIONS.has(event.action)) return new Response("ignored", { status: 200 })
+
+  const input: ReviewInput = {
+    owner: event.repository.owner.login,
+    repo: event.repository.name,
+    prNumber: event.pull_request.number,
+    prTitle: event.pull_request.title,
+    baseBranch: event.pull_request.base.ref,
+    headRef: event.pull_request.head.ref,
+    cloneUrl: event.repository.clone_url,
+  }
+  // Fire-and-forget — webhook should return quickly so GitHub doesn't retry.
+  runReview(input, opencodeServerUrl, postAsReview(input)).catch((err) =>
+    console.error(`[${tagOf(input)}] webhook review failed`, err),
+  )
+  return new Response("queued", { status: 202 })
+}
+
+async function pollWatchedRepos(opencodeServerUrl: string): Promise<void> {
+  const since = Date.now() - env.POLL_INTERVAL_MS
+  for (const spec of env.WATCHED_REPOS) {
+    const [owner, repo] = spec.split("/")
+    if (!owner || !repo) {
+      console.warn(`[poll] invalid WATCHED_REPOS entry: ${spec}`)
+      continue
+    }
+    try {
+      const recent = await listRecentPRs(owner, repo, since)
+      console.log(`[poll] ${spec}: ${recent.length} recent PR(s)`)
+      for (const pr of recent) {
+        const input: ReviewInput = {
+          owner,
+          repo,
+          prNumber: pr.number,
+          prTitle: pr.title,
+          baseBranch: pr.base.ref,
+          headRef: pr.head.ref,
+          cloneUrl: pr.base.repo.clone_url,
+        }
+        try {
+          await runReview(input, opencodeServerUrl, postAsLog(input))
+        } catch (err) {
+          console.error(`[${tagOf(input)}] poll review failed`, err)
+        }
+      }
+    } catch (err) {
+      console.error(`[poll] ${spec} listing failed`, err)
+    }
+  }
+}
+
+async function listRecentPRs(
+  owner: string,
+  repo: string,
+  sinceMs: number,
+): Promise<RestEndpointMethodTypes["pulls"]["list"]["response"]["data"]> {
+  // pulls.list defaults to sort=created direction=desc, so we can short-circuit
+  // on the first PR older than `sinceMs`. 100 results per page is enough; if
+  // any project opens >100 PRs in 24h we have bigger problems than coverage.
+  const { data } = await octokit.rest.pulls.list({ owner, repo, state: "open", per_page: 100 })
+  const recent: typeof data = []
+  for (const pr of data) {
+    if (Date.parse(pr.created_at) < sinceMs) break
+    recent.push(pr)
+  }
+  return recent
+}
+
+async function runReview(input: ReviewInput, opencodeServerUrl: string, post: Poster): Promise<void> {
+  const tag = tagOf(input)
+  const workdir = await mkdtemp(path.join(os.tmpdir(), `${tag}-`))
+  console.log(`[${tag}] starting review at ${workdir}`)
+
+  try {
+    await cloneRepo({
+      cloneUrl: authedCloneUrl(input.cloneUrl),
+      ref: input.headRef,
+      baseRef: input.baseBranch,
+      cwd: workdir,
+    })
+    const reviewText = await runReviewSession({ directory: workdir, opencodeServerUrl, ...input })
+    if (!reviewText) {
+      console.error(`[${tag}] no review text returned from opencode`)
+      return
+    }
+    await post(reviewText)
+    console.log(`[${tag}] review delivered`)
+  } finally {
+    await rm(workdir, { recursive: true, force: true }).catch((err) => console.error(`[${tag}] cleanup failed`, err))
+  }
+}
+
+function postAsReview(input: ReviewInput): Poster {
+  return async (text) => {
+    await octokit.rest.pulls.createReview({
+      owner: input.owner,
+      repo: input.repo,
+      pull_number: input.prNumber,
+      event: "COMMENT",
+      body: text,
+    })
+  }
+}
+
+function postAsLog(input: ReviewInput): Poster {
+  const tag = tagOf(input)
+  return async (text) => {
+    console.log(`\n=== [${tag}] review (log-only) ===\n${text}\n=== end review ===\n`)
+  }
+}
+
+function tagOf(input: ReviewInput): string {
+  return `${input.owner}/${input.repo}#${input.prNumber}`
+}
 
 function verifySignature(body: string, header: string): boolean {
   const expected = "sha256=" + createHmac("sha256", env.GITHUB_WEBHOOK_SECRET).update(body).digest("hex")
@@ -87,48 +285,7 @@ function verifySignature(body: string, header: string): boolean {
   return timingSafeEqual(Buffer.from(header), Buffer.from(expected))
 }
 
-async function runReview(event: PullRequestEvent): Promise<void> {
-  const pr = event.pull_request
-  const owner = event.repository.owner.login
-  const repo = event.repository.name
-  const tag = `pr-${repo}-${pr.number}`
-  const workdir = await mkdtemp(path.join(os.tmpdir(), `${tag}-`))
-  console.log(`[${tag}] starting review at ${workdir}`)
-
-  try {
-    await cloneRepo({
-      cloneUrl: authedCloneUrl(event.repository.clone_url),
-      ref: pr.head.ref,
-      baseRef: pr.base.ref,
-      cwd: workdir,
-    })
-
-    const reviewText = await runReviewSession({
-      directory: workdir,
-      prTitle: pr.title,
-      prNumber: pr.number,
-      baseBranch: pr.base.ref,
-    })
-
-    if (!reviewText) {
-      console.error(`[${tag}] no review text returned from opencode`)
-      return
-    }
-
-    await octokit.rest.issues.createComment({
-      owner,
-      repo,
-      issue_number: pr.number,
-      body: reviewText,
-    })
-    console.log(`[${tag}] posted review`)
-  } finally {
-    await rm(workdir, { recursive: true, force: true }).catch((err) => console.error(`[${tag}] cleanup failed`, err))
-  }
-}
-
 function authedCloneUrl(cloneUrl: string): string {
-  // GitHub clone URLs are https://github.com/<owner>/<repo>.git — inject the token for private repo access.
   const url = new URL(cloneUrl)
   url.username = "x-access-token"
   url.password = env.GITHUB_TOKEN
@@ -157,6 +314,7 @@ function runCmd(cmd: string, args: string[], cwd: string): Promise<void> {
 
 async function runReviewSession(input: {
   directory: string
+  opencodeServerUrl: string
   prTitle: string
   prNumber: number
   baseBranch: string
@@ -164,7 +322,7 @@ async function runReviewSession(input: {
   // Sessions are bare; agent + model are bound per-message via the v1
   // /session/:id/message endpoint, which returns the assistant message
   // synchronously with all its parts attached.
-  const session = await opencode<{ id: string }>("/session", {
+  const session = await opencode<{ id: string }>(input.opencodeServerUrl, "/session", {
     method: "POST",
     directory: input.directory,
     body: { title: `PR #${input.prNumber} review` },
@@ -177,6 +335,7 @@ async function runReviewSession(input: {
   ].join("\n\n")
 
   const reply = await opencode<{ parts: Array<{ type: string; text?: string }> }>(
+    input.opencodeServerUrl,
     `/session/${session.id}/message`,
     {
       method: "POST",
@@ -193,14 +352,15 @@ async function runReviewSession(input: {
 }
 
 async function opencode<T = unknown>(
+  serverUrl: string,
   pathname: string,
   options: { method: string; directory: string; body?: unknown; expect?: number },
 ): Promise<T> {
-  const res = await fetch(`${env.OPENCODE_SERVER_URL}${pathname}`, {
+  const res = await fetch(`${serverUrl}${pathname}`, {
     method: options.method,
     headers: {
       "content-type": "application/json",
-      authorization: opencodeAuthHeader,
+      authorization: opencodeAuth,
       "x-opencode-directory": options.directory,
     },
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
@@ -213,3 +373,8 @@ async function opencode<T = unknown>(
   if (res.status === 204) return undefined as T
   return (await res.json()) as T
 }
+
+main().catch((err) => {
+  console.error("fatal", err)
+  process.exit(1)
+})
