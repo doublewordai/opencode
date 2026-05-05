@@ -1,13 +1,12 @@
-# Local-development docker-compose for the COR-364 PR-review experiment harness.
-#
-# Two-container mode for parity with how the harness ran during early local
-# development. Cloud Run uses a single-container variant where the shim
-# self-spawns opencode-server (when OPENCODE_SERVER_URL is unset).
+# Two-container local-dev variant of the harness for parity with how it ran
+# during early development. Cloud Run uses single-container mode where the
+# shim self-spawns opencode-server (CMD=["pr-review-shim"], default).
 #
 # Build the image first (from the repo root):
 #   (cd packages/opencode && bun run build)
 #   (cd packages/pr-review-shim && bun run build)
-#   docker build -f packages/pr-review-shim/Dockerfile -t pr-review-harness .
+#   docker build --platform linux/amd64 -f packages/pr-review-shim/Dockerfile \
+#     -t pr-review-harness .
 #
 # Then run:
 #   docker compose -f packages/pr-review-shim/docker-compose.yml up
@@ -23,11 +22,11 @@
 services:
   opencode-server:
     image: pr-review-harness
-    command: ["opencode-server"]
+    entrypoint: ["/sbin/tini", "--", "/usr/local/bin/opencode"]
+    command: ["serve", "--hostname", "0.0.0.0", "--port", "14123"]
     environment:
       DOUBLEWORD_API_KEY: ${DOUBLEWORD_API_KEY}
       OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD}
-      OPENCODE_PORT: "14123"
     expose:
       - "14123"
     healthcheck:
@@ -35,13 +34,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
-    # Workspaces are mounted from the host so the shim's clones are visible to the server.
     volumes:
       - shim-workspaces:/tmp
 
   pr-review-shim:
     image: pr-review-harness
-    command: ["shim"]
     environment:
       DOUBLEWORD_API_KEY: ${DOUBLEWORD_API_KEY}
       GITHUB_TOKEN: ${GITHUB_TOKEN}
