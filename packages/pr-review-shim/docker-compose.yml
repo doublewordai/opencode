@@ -1,5 +1,9 @@
 # Local-development docker-compose for the COR-364 PR-review experiment harness.
 #
+# Two-container mode for parity with how the harness ran during early local
+# development. Cloud Run uses a single-container variant where the shim
+# self-spawns opencode-server (when OPENCODE_SERVER_URL is unset).
+#
 # Build the image first (from the repo root):
 #   (cd packages/opencode && bun run build)
 #   (cd packages/pr-review-shim && bun run build)
@@ -13,6 +17,9 @@
 #   GITHUB_TOKEN=...
 #   GITHUB_WEBHOOK_SECRET=...
 #   OPENCODE_SERVER_PASSWORD=...
+# Optional:
+#   WATCHED_REPOS=owner/repo,owner/repo  # comma-separated; reviews logged to stdout
+#   POLL_INTERVAL_MS=86400000             # default 24h
 services:
   opencode-server:
     image: pr-review-harness
@@ -42,6 +49,8 @@ services:
       OPENCODE_SERVER_URL: http://opencode-server:14123
       OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD}
       PORT: "8080"
+      WATCHED_REPOS: ${WATCHED_REPOS:-}
+      POLL_INTERVAL_MS: ${POLL_INTERVAL_MS:-86400000}
     ports:
       - "8080:8080"
     depends_on:
