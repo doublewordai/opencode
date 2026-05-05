@@ -9,5 +9,8 @@
   },
   "dependencies": {
     "@ai-sdk/openai": "3.0.61"
+  },
+  "devDependencies": {
+    "ai": "6.0.175"
   }
 }

@@ -3,7 +3,7 @@
   "provider": {
     "doubleword": {
       "npm": "file:///app/doubleword-responses-wrapper/index.js",
-      "name": "Doubleword (Responses API + flex)",
+      "name": "Doubleword (Responses API + flex + background)",
       "env": ["DOUBLEWORD_API_KEY"],
       "options": {
         "baseURL": "https://api.doubleword.ai/v1",
