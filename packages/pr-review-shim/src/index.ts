@@ -25,12 +25,15 @@ import { mkdtemp, rm } from "node:fs/promises"
 import path from "node:path"
 import os from "node:os"
 import { Octokit, type RestEndpointMethodTypes } from "@octokit/rest"
+import { createAppAuth } from "@octokit/auth-app"
 
 const DEFAULT_OPENCODE_PORT = 14123
 
 const env = {
   DOUBLEWORD_API_KEY: requireEnv("DOUBLEWORD_API_KEY"),
-  GITHUB_TOKEN: requireEnv("GITHUB_TOKEN"),
+  GITHUB_APP_ID: requireEnv("GITHUB_APP_ID"),
+  GITHUB_INSTALLATION_ID: requireEnv("GITHUB_INSTALLATION_ID"),
+  GITHUB_PRIVATE_KEY: requireEnv("GITHUB_PRIVATE_KEY"),
   GITHUB_WEBHOOK_SECRET: requireEnv("GITHUB_WEBHOOK_SECRET"),
   OPENCODE_SERVER_PASSWORD: requireEnv("OPENCODE_SERVER_PASSWORD"),
   OPENCODE_SERVER_URL: process.env.OPENCODE_SERVER_URL,
@@ -55,7 +58,23 @@ function requireEnv(name: string): string {
   return value
 }
 
-const octokit = new Octokit({ auth: env.GITHUB_TOKEN })
+// GitHub App authentication. The Octokit instance auto-mints + caches
+// installation tokens (1h validity); auth({ type: "installation" }) returns
+// the current token, which we use for git clone HTTPS auth.
+const octokit = new Octokit({
+  authStrategy: createAppAuth,
+  auth: {
+    appId: env.GITHUB_APP_ID,
+    privateKey: env.GITHUB_PRIVATE_KEY,
+    installationId: env.GITHUB_INSTALLATION_ID,
+  },
+})
+
+async function installationToken(): Promise<string> {
+  const auth = (await octokit.auth({ type: "installation" })) as { token: string }
+  return auth.token
+}
+
 const opencodeAuth = "Basic " + Buffer.from(`opencode:${env.OPENCODE_SERVER_PASSWORD}`).toString("base64")
 
 type PullRequestEvent = {
@@ -240,7 +259,7 @@ async function runReview(input: ReviewInput, opencodeServerUrl: string, post: Po
 
   try {
     await cloneRepo({
-      cloneUrl: authedCloneUrl(input.cloneUrl),
+      cloneUrl: await authedCloneUrl(input.cloneUrl),
       ref: input.headRef,
       baseRef: input.baseBranch,
       cwd: workdir,
@@ -286,10 +305,13 @@ function verifySignature(body: string, header: string): boolean {
   return timingSafeEqual(Buffer.from(header), Buffer.from(expected))
 }
 
-function authedCloneUrl(cloneUrl: string): string {
+async function authedCloneUrl(cloneUrl: string): Promise<string> {
+  // GitHub App installation tokens authenticate HTTPS clones via the
+  // x-access-token user, same as PATs. Token is short-lived (1h); minted
+  // fresh per clone via the cached App auth strategy.
   const url = new URL(cloneUrl)
   url.username = "x-access-token"
-  url.password = env.GITHUB_TOKEN
+  url.password = await installationToken()
   return url.toString()
 }
 
