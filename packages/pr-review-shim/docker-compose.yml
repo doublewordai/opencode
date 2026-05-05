@@ -1,0 +1,54 @@
+# Local-development docker-compose for the COR-364 PR-review experiment harness.
+#
+# Build the image first (from the repo root):
+#   (cd packages/opencode && bun run build)
+#   (cd packages/pr-review-shim && bun run build)
+#   docker build -f packages/pr-review-shim/Dockerfile -t pr-review-harness .
+#
+# Then run:
+#   docker compose -f packages/pr-review-shim/docker-compose.yml up
+#
+# Required env (drop into a .env file alongside this compose file):
+#   DOUBLEWORD_API_KEY=...
+#   GITHUB_TOKEN=...
+#   GITHUB_WEBHOOK_SECRET=...
+#   OPENCODE_SERVER_PASSWORD=...
+services:
+  opencode-server:
+    image: pr-review-harness
+    command: ["opencode-server"]
+    environment:
+      DOUBLEWORD_API_KEY: ${DOUBLEWORD_API_KEY}
+      OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD}
+      OPENCODE_PORT: "14123"
+    expose:
+      - "14123"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:14123/api/session", "--user", "opencode", "--password", "${OPENCODE_SERVER_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    # Workspaces are mounted from the host so the shim's clones are visible to the server.
+    volumes:
+      - shim-workspaces:/tmp
+
+  pr-review-shim:
+    image: pr-review-harness
+    command: ["shim"]
+    environment:
+      DOUBLEWORD_API_KEY: ${DOUBLEWORD_API_KEY}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET}
+      OPENCODE_SERVER_URL: http://opencode-server:14123
+      OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD}
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      opencode-server:
+        condition: service_healthy
+    volumes:
+      - shim-workspaces:/tmp
+
+volumes:
+  shim-workspaces:
