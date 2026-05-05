@@ -1,0 +1,73 @@
+# Cloud Build upload allowlist for the COR-362 PR-review experiment harness.
+#
+# The Dockerfile at packages/pr-review-shim/Dockerfile copies only:
+#   - packages/opencode/dist/opencode-linux-x64-baseline-musl/bin/opencode
+#   - packages/pr-review-shim/dist/pr-review-shim-linux-x64-musl/bin/pr-review-shim
+#   - packages/pr-review-shim/Dockerfile
+#   - opencode.json
+#   - docs/doubleword.md
+#   - packages/<phase-wrapper>/dist/index.js  (phase-2 / 3 / 4)
+#
+# Without this file the source tarball is ~7.8 GB (node_modules + multi-arch
+# dist + .git history) which trips Cloud Build's 1 GB upload limit. Excluding
+# the heavy hitters brings the upload to <500 MB.
+
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# Workspace dependencies (Bun reinstalls cleanly inside the Cloud Build
+# environment if needed; our Dockerfile doesn't run bun at all).
+node_modules/
+**/node_modules/
+
+# Opencode dist — only the linux-x64-baseline-musl flavour ships in the image.
+# Everything else (~1.5 GB combined) is dead weight in the upload.
+packages/opencode/dist/opencode-darwin-arm64/
+packages/opencode/dist/opencode-darwin-x64/
+packages/opencode/dist/opencode-darwin-x64-baseline/
+packages/opencode/dist/opencode-linux-arm64/
+packages/opencode/dist/opencode-linux-arm64-musl/
+packages/opencode/dist/opencode-linux-x64/
+packages/opencode/dist/opencode-windows-x64/
+packages/opencode/dist/opencode-windows-x64-baseline/
+
+# Shim dist — only the linux-x64-musl flavour ships in the image.
+packages/pr-review-shim/dist/pr-review-shim-linux-arm64-musl/
+
+# Build caches
+.cache/
+**/.cache/
+.turbo/
+**/.turbo/
+
+# Editor / OS noise
+.DS_Store
+**/.DS_Store
+*.log
+**/*.log
+.idea/
+.vscode/
+
+# Sibling-package source code that isn't COPY'd into the image. Only the
+# compiled binaries / bundles we explicitly COPY are needed at build time.
+packages/app/
+packages/console/
+packages/containers/
+packages/core/
+packages/desktop/
+packages/enterprise/
+packages/extensions/
+packages/function/
+packages/identity/
+packages/plugin/
+packages/sdk/
+packages/script/
+packages/slack/
+packages/storybook/
+packages/ui/
+packages/web/
+
+# Translated READMEs (one-off doc churn, not used in the image)
+README.*.md
