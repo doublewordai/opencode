@@ -41,7 +41,19 @@ const env = {
   PORT: Number(process.env.PORT ?? 8080),
   REVIEW_AGENT: process.env.REVIEW_AGENT ?? "review",
   REVIEW_MODEL_PROVIDER: process.env.REVIEW_MODEL_PROVIDER ?? "doubleword",
-  REVIEW_MODEL_ID: process.env.REVIEW_MODEL_ID ?? "Qwen/Qwen3.5-397B-A17B-FP8",
+  // REVIEW_MODEL_ID is the source of truth for which Doubleword-served model
+  // the agent runs. opencode.json registers the model as `{env:REVIEW_MODEL_ID}`
+  // (substituted at config-load time), so the model registry and the shim's
+  // per-message override stay aligned automatically. Required — fail loud if
+  // unset rather than registering an empty model and 404-ing at runtime.
+  REVIEW_MODEL_ID: requireEnv("REVIEW_MODEL_ID"),
+  // 30 min is well under the Cloud Run 60-min request cap and well above the
+  // observed range of long research-heavy reviews. Bun's default fetch has no
+  // explicit timeout but the platform appears to drop the connection at ~5 min,
+  // which we hit when steps=100 + a research-mandate prompt produced enough
+  // tool loops to exceed it. Fail loud past 30 min — anything longer is a
+  // runaway loop, not legitimate work.
+  OPENCODE_FETCH_TIMEOUT_MS: Number(process.env.OPENCODE_FETCH_TIMEOUT_MS ?? 30 * 60 * 1000),
   // opencode loads agent + provider config from this file relative to the
   // workspace directory (the x-opencode-directory header value). We copy this
   // file into each cloned PR worktree so the `review` agent + Doubleword
@@ -512,6 +524,7 @@ async function opencode<T = unknown>(
       "x-opencode-directory": options.directory,
     },
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    signal: AbortSignal.timeout(env.OPENCODE_FETCH_TIMEOUT_MS),
   })
   const expectedStatus = options.expect ?? 200
   if (res.status !== expectedStatus) {
