@@ -430,6 +430,62 @@ Phase-3 friction-tally entry added to the running list below.
 
 ---
 
+## Phase 4 results — Open Responses API + service_tier=flex + background=true (poll)
+
+**The wrapper architecture worked. The body schema is the showstopper.** Cloud Run revisions `pr-review-harness-00019-gwx` (Qwen 397B) and `pr-review-harness-00020-z2l` (DeepSeek-V4-Flash) both deployed cleanly from the phase-4 image. The wrapper's polling logic — submit POST `/v1/responses` with `background=true` + `service_tier=flex`, get a `resp_*` ID back, poll `GET /v1/responses/<id>` every 2s until status flips to a terminal state, synthesize a final response for the SDK — sidestepped both the streaming-vs-batching mismatch (phase 2) and the streaming-vs-async-envelope mismatch (phase 3) on the SDK ↔ tier axis. The hypothesis was right.
+
+But every run failed at a *new* boundary. From the Doubleword executor:
+
+```
+NonRetriableHttpStatus 500
+"executor error: model call returned HTTP 422 Unprocessable Entity:
+ Failed to deserialize the JSON body into the target type:
+ messages[1].content: data did not match any variant of
+ untagged enum MessageContent at line 1 column 27794"
+```
+
+What's happening: opencode's agent loop generates multi-turn conversation history including tool-call and tool-result message content. The Vercel AI SDK's `provider.responses()` serializes that history into the **OpenAI Responses API request body shape** — different from the chat-completions shape phase 1 uses. The Responses-API content shape includes part types like `input_text`, `output_text`, plus tool-call/tool-result message-content variants. **Doubleword's executor's `MessageContent` enum has variants for the chat-completions shape but not for the full Responses-API request shape.** Tested with both `Qwen/Qwen3.5-397B-A17B-FP8` and `deepseek-ai/DeepSeek-V4-Flash` — both fail with the same 422. **Not model-specific; it's a Doubleword-side schema gap.**
+
+### Why phase 1 didn't see this
+
+Phase 1 uses `@ai-sdk/openai-compatible` against `/v1/chat/completions`. Message shape on that endpoint is the chat-completions shape: `messages[].content` is either a string or an array of `{type: "text"|"image_url", …}` parts. Universally supported across model-serving infrastructure. **Phase 1 never produces a Responses-API request body at all.** Phases 3 + 4 are the first to attempt that path; phase 3 failed at the SDK validator before reaching the executor; phase 4 is the first to actually hand a Responses-API body to Doubleword and discover the deserializer can't handle it.
+
+### Wrapper bug surfaced and fixed
+
+While debugging the first phase-4 run, we found the wrapper had been swallowing terminal failures: it always synthesized a `200` response from any terminal status — including `failed`, `incomplete`, `cancelled`, etc. The SDK parsed those as successful empty responses, opencode marked the assistant message complete-but-empty, and the shim's only signal was an uninformative *"no review text returned from opencode"* log. The actual upstream 422 was visible only in Doubleword-side logs.
+
+Fixed in commit `experiment(phase-4): wrapper now surfaces upstream terminal failures` — the polling wrapper now maps non-`completed` terminal statuses to `502` with the failure body and adds a `console.error` so Cloud Run logs surface the actual upstream error. Phase-4-only commit (the wrapper lives only on this branch). Worth noting as itself a piece of friction: when you write a custom wrapper to bridge two third-party SDKs, you also write the error-propagation contract — and getting that wrong silently hides upstream failures.
+
+### Three different structural integration failures across three phases
+
+| Phase | Inference path | Failure boundary |
+|---|---|---|
+| 1 | `chat-completions` realtime sync | Works (17/24 with Qwen 397B + new harness) |
+| 2 | autobatcher (flex via Vercel-AI batch SDK) | SDK ↔ provider: `streamText` rejected; provider only supports `generateText` |
+| 3 | Responses API + `service_tier=flex`, no background | SDK ↔ tier: SSE-delta validator vs in-progress-envelope wire format |
+| 4 | Responses API + `service_tier=flex` + `background=true` | Vercel AI SDK ↔ Doubleword executor: Responses-API request body shape vs executor's `MessageContent` enum |
+
+**The headline:** customer-side tool execution requires the customer to bridge SDK ↔ inference-tier capability mismatches at three different layers — and our experiment failed at all three.
+
+- Phase 2: between the agent SDK and the provider library (streaming/batching mismatch).
+- Phase 3: between the SDK's response validator and the tier's wire format (SSE deltas vs envelopes).
+- Phase 4: between the SDK's request serializer and the executor's deserializer (chat-completions vs Responses-API content shapes).
+
+Each failure is configurable-around in *theory* but requires the customer to write more wrapper code against APIs they don't own and don't control the schema of. **A platform-side tool loop ([Multi-Tier Agentic Tools](https://linear.app/doubleword/project/multi-tier-agentic-tools-70de986f3f32)) that owns model selection, tier routing, and request/response normalisation is the *only* path that doesn't expose any of these surfaces to the customer.** That's the experimental finding.
+
+### Open question for Doubleword infra team
+
+Per Seb (paraphrased): *"the Doubleword inference backend should support all open responses formats."* The phase-4 422 says otherwise — there's a Responses-API request-body shape the executor doesn't handle. Two specific things would unblock real phase-4 benchmarks:
+
+1. Add the missing `MessageContent` variants to the executor's deserializer so it accepts Vercel-AI-SDK-generated Responses API request bodies. Likely the tool-call / tool-result content parts.
+2. Once that lands, re-run phase 4 with both Qwen 397B and DeepSeek-V4-Flash and append benchmarks to this doc.
+
+Until then, **phase 4 is blocked on Doubleword-side schema work** and we report it as such.
+
+Phase-4 friction-tally entry added to the running list below.
+
+---
+
 ## Production friction observed (running tally)
 
 This section is the load-bearing payload of the experiment. Every piece of friction recorded here is something that *only exists because tool execution lives client-side*. A Doubleword-hosted server-side tool loop ([Multi-Tier Agentic Tools](https://linear.app/doubleword/project/multi-tier-agentic-tools-70de986f3f32)) could in principle ship `github_review_pr` as a hosted capability with most of this concealed inside the platform.
@@ -462,7 +518,10 @@ These are first-time-only mistakes, but each is a representative customer footgu
 
 - **Streaming validator vs async-envelope mismatch is fatal at integration, not at scale.** Phase 3 routes inference through `@ai-sdk/openai`'s `provider.responses(...)` with `service_tier=flex` injected into every request body. opencode's agent loop calls `streamText()`, which the Vercel AI SDK turns into a streaming POST `/v1/responses` and then validates each chunk of the SSE stream against a Zod schema enumerating OpenAI's specific event types (`response.output_text.delta`, `response.output_text.done`, etc.). Doubleword's flex tier instead returns a single **"in-progress" response envelope** (`{id: "resp_...", object: "response", status: "in_progress"}`) as the initial wire payload — the actual content arrives only via subsequent polling of `GET /v1/responses/<id>`. The SDK's validator rejected the envelope as `invalid_union` on the `type` field within ~8s. The agent loop never started, no ground-truth issue scored. **A second, structurally-identical failure to phase 2 at a different layer:** in phase 2 the streaming/batch axis didn't match between SDK and provider; in phase 3 the streaming/async-envelope axis doesn't match between SDK and provider. The customer is given a third-party agent runtime, a third-party AI SDK, and a third-party inference tier — and asked to make them agree on whether responses are streamed, batched, or polled. There is no shared protocol; only convention, and conventions diverge across tiers. The fix exists (phase 4: fire-and-poll explicitly with `background=true`), but it requires the customer to write yet another wrapper that knows the precise polling protocol of *this specific provider*. **A platform-side tool loop would absorb this entirely** — the customer talks to one durable-step API regardless of how each tier under the hood wants to deliver tokens.
 
-(Phase 4 will append its own friction findings to this section.)
+### Phase 4 (Open Responses API + flex + background, poll) — design-level friction
+
+- **Vercel-AI-SDK Responses-API request body doesn't deserialize on Doubleword's executor.** Phase 4's wrapper sidesteps the SDK ↔ tier mismatches that broke phases 2 and 3 — it owns the full fire-and-poll dance internally (`background=true`, `service_tier=flex`, poll `GET /v1/responses/<id>` every 2s until terminal, synthesize a single response for the SDK). That layer worked. But once the request actually reached Doubleword's model executor, every run failed identically with `HTTP 422 Unprocessable Entity: Failed to deserialize the JSON body into the target type: messages[1].content: data did not match any variant of untagged enum MessageContent`. Tested with both `Qwen/Qwen3.5-397B-A17B-FP8` and `deepseek-ai/DeepSeek-V4-Flash`. Not model-specific; the executor's `MessageContent` enum has variants for the chat-completions message shape (which phase 1 uses successfully) but not for the Responses-API request-body shape (the part types like `input_text`, `output_text`, and the tool-call/tool-result message content the Vercel AI SDK serialises). **A third structural failure at a third boundary** — at the customer's request-serializer ↔ provider's deserializer interface, which neither side owns and neither can independently fix. **Each phase failed at a different layer**: phase 2 at SDK ↔ provider library (streaming vs batching), phase 3 at SDK validator ↔ tier wire format (SSE deltas vs in-progress envelopes), phase 4 at SDK serializer ↔ executor deserializer (chat-completions content shape vs Responses-API content shape). Configurable around in theory but only by the customer writing yet more wrapper code against schemas they don't own and don't control. **A platform-side tool loop owns model selection, tier routing, and request/response normalisation as a single internal concern — none of these three boundaries would exist for the customer.** Unblocking phase 4 specifically requires Doubleword's executor to add the missing `MessageContent` variants for the Responses-API request body; once that lands we can run phase 4 properly and benchmark against the phase-1 baseline.
+- **Custom wrappers write their own error-propagation contracts (and get them wrong).** When phase 4 first failed, the wrapper synthesised a `200` response from *any* terminal status — including `failed`, `incomplete`, `cancelled`. The SDK parsed those as successful empty responses, opencode marked the assistant message complete-but-empty, and our shim's only signal was an uninformative *"no review text returned from opencode"* log. The actual upstream 422 was visible only in Doubleword-side logs we happened to have access to. Fixed by mapping non-`completed` terminal statuses to `502` with the failure body + a wrapper-side `console.error`. This is itself a recurring pattern of client-side-tool friction: every wrapper a customer writes to bridge a third-party-SDK ↔ third-party-API mismatch is also where the *error contract* gets defined; getting it wrong silently hides upstream failures. A platform-side tool loop has one error contract owned by Doubleword end-to-end.
 
 ---
 
