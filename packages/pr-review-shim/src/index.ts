@@ -103,7 +103,22 @@ type ReviewInput = {
   cloneUrl: string
 }
 
-type Poster = (text: string) => Promise<void>
+type ReviewSeverity = "Blocking" | "Non-blocking" | "Nit"
+
+type InlineReviewComment = {
+  path: string
+  line: number
+  side?: "LEFT" | "RIGHT"
+  severity?: ReviewSeverity
+  body: string
+}
+
+type ParsedReview = {
+  summary: string
+  comments: InlineReviewComment[]
+}
+
+type Poster = (parsed: ParsedReview, raw: string) => Promise<void>
 
 const TRIGGER_ACTIONS = new Set(["opened", "synchronize", "reopened"])
 
@@ -279,30 +294,120 @@ async function runReview(input: ReviewInput, opencodeServerUrl: string, post: Po
       console.error(`[${tag}] no review text returned from opencode`)
       return
     }
-    await post(reviewText)
-    console.log(`[${tag}] review delivered`)
+    const parsed = parseReviewOutput(reviewText, tag)
+    await post(parsed, reviewText)
+    console.log(
+      `[${tag}] review delivered (${parsed.comments.length} inline comment${parsed.comments.length === 1 ? "" : "s"})`,
+    )
   } finally {
     await rm(workdir, { recursive: true, force: true }).catch((err) => console.error(`[${tag}] cleanup failed`, err))
   }
 }
 
 function postAsReview(input: ReviewInput): Poster {
-  return async (text) => {
-    await octokit.rest.pulls.createReview({
-      owner: input.owner,
-      repo: input.repo,
-      pull_number: input.prNumber,
-      event: "COMMENT",
-      body: text,
-    })
+  const tag = tagOf(input)
+  return async (parsed, raw) => {
+    const apiComments = parsed.comments.map((c) => ({
+      path: c.path,
+      line: c.line,
+      side: c.side ?? "RIGHT",
+      body: c.body,
+    }))
+    try {
+      await octokit.rest.pulls.createReview({
+        owner: input.owner,
+        repo: input.repo,
+        pull_number: input.prNumber,
+        event: "COMMENT",
+        body: parsed.summary,
+        comments: apiComments,
+      })
+      return
+    } catch (err) {
+      // GitHub rejects the entire review (422) if any inline comment references
+      // a line outside the diff. Don't lose the review — retry with summary
+      // only, and append the inline findings as text so they're still visible.
+      const status = (err as { status?: number }).status
+      if (status !== 422) throw err
+      console.warn(
+        `[${tag}] createReview rejected ${apiComments.length} inline comment(s) (422); retrying summary-only`,
+      )
+      await octokit.rest.pulls.createReview({
+        owner: input.owner,
+        repo: input.repo,
+        pull_number: input.prNumber,
+        event: "COMMENT",
+        body: parsed.comments.length > 0 ? `${parsed.summary}\n\n${renderCommentsAsMarkdown(parsed.comments)}` : raw,
+      })
+    }
   }
 }
 
 function postAsLog(input: ReviewInput): Poster {
   const tag = tagOf(input)
-  return async (text) => {
-    console.log(`\n=== [${tag}] review (log-only) ===\n${text}\n=== end review ===\n`)
+  return async (parsed) => {
+    const inline = parsed.comments.length > 0 ? `\n\n${renderCommentsAsMarkdown(parsed.comments)}` : ""
+    console.log(`\n=== [${tag}] review (log-only) ===\n${parsed.summary}${inline}\n=== end review ===\n`)
   }
+}
+
+function renderCommentsAsMarkdown(comments: InlineReviewComment[]): string {
+  const lines = ["## Inline findings (could not anchor to diff)", ""]
+  for (const c of comments) {
+    const sev = c.severity ? `**${c.severity}** ` : ""
+    lines.push(`- ${sev}\`${c.path}:${c.line}\` — ${c.body.split("\n")[0]}`)
+  }
+  return lines.join("\n")
+}
+
+const JSON_FENCE_RE = /```(?:json)?\s*(\{[\s\S]*?\})\s*```/g
+
+function parseReviewOutput(text: string, tag: string): ParsedReview {
+  // Find the LAST fenced JSON block — agents sometimes include illustrative
+  // JSON earlier (e.g. quoting the prompt's example schema) before the real one.
+  let lastMatch: RegExpExecArray | null = null
+  for (let m: RegExpExecArray | null; (m = JSON_FENCE_RE.exec(text)); ) lastMatch = m
+
+  const jsonBody = lastMatch?.[1]
+  if (!jsonBody) {
+    console.warn(`[${tag}] no JSON block found in agent output; falling back to raw text as summary`)
+    return { summary: text, comments: [] }
+  }
+
+  let raw: unknown
+  try {
+    raw = JSON.parse(jsonBody)
+  } catch (err) {
+    console.warn(`[${tag}] JSON parse failed (${(err as Error).message}); falling back to raw text as summary`)
+    return { summary: text, comments: [] }
+  }
+
+  if (!raw || typeof raw !== "object") {
+    console.warn(`[${tag}] agent JSON is not an object; falling back to raw text as summary`)
+    return { summary: text, comments: [] }
+  }
+
+  const obj = raw as Record<string, unknown>
+  const summary = typeof obj.summary === "string" ? obj.summary : ""
+  const commentsIn = Array.isArray(obj.comments) ? obj.comments : []
+  const comments: InlineReviewComment[] = []
+  for (const c of commentsIn) {
+    if (!c || typeof c !== "object") continue
+    const cc = c as Record<string, unknown>
+    const path = typeof cc.path === "string" ? cc.path : null
+    const line = typeof cc.line === "number" && Number.isInteger(cc.line) && cc.line > 0 ? cc.line : null
+    const body = typeof cc.body === "string" ? cc.body : null
+    if (!path || line === null || !body) continue
+    const side = cc.side === "LEFT" ? "LEFT" : "RIGHT"
+    const severity =
+      cc.severity === "Blocking" || cc.severity === "Non-blocking" || cc.severity === "Nit" ? cc.severity : undefined
+    comments.push({ path, line, side, severity, body })
+  }
+  if (!summary && comments.length === 0) {
+    console.warn(`[${tag}] agent JSON had neither summary nor valid comments; falling back to raw text`)
+    return { summary: text, comments: [] }
+  }
+  return { summary: summary || "(no summary returned)", comments }
 }
 
 function tagOf(input: ReviewInput): string {
