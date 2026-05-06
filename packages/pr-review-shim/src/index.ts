@@ -130,6 +130,12 @@ type InlineReviewComment = {
   side?: "LEFT" | "RIGHT"
   severity?: ReviewSeverity
   body: string
+  // Optional: the literal diff line content the model claims to be commenting
+  // on. Used for pre-validation against the actual PR diff so we never send
+  // an inline comment to GitHub with a line ref that doesn't match what's at
+  // that line. Mismatches get demoted to general findings rather than 422-ing
+  // the entire createReview call. See the prompt schema in opencode.json.
+  code?: string
 }
 
 type ParsedReview = {
@@ -326,7 +332,29 @@ async function runReview(input: ReviewInput, opencodeServerUrl: string, post: Po
 function postAsReview(input: ReviewInput): Poster {
   const tag = tagOf(input)
   return async (parsed, raw) => {
-    const apiComments = parsed.comments.map((c) => ({
+    // Validate every inline comment against the actual PR diff before calling
+    // createReview. GitHub's createReview rejects the *entire* review with HTTP
+    // 422 if any comment references a line outside the diff hunks — losing 11
+    // valid findings to one stale ref. We pre-validate by fetching the PR's
+    // file patches, building a map of valid {path → side → line → diff content},
+    // and dropping any inline comment whose (path, line, side) isn't in it (or,
+    // when the model provided a `code` self-check, whose `code` doesn't match
+    // the actual diff line at that position). Rejected comments are demoted to
+    // a "## General findings" section in the summary so we don't lose them.
+    const diffLines = await fetchDiffLineMap(input).catch((err) => {
+      console.warn(`[${tag}] failed to fetch PR diff for validation; posting unchecked: ${(err as Error).message}`)
+      return null
+    })
+    const validated = diffLines ? validateInlineComments(parsed.comments, diffLines, tag) : { valid: parsed.comments, rejected: [] }
+    const summary = validated.rejected.length > 0
+      ? `${parsed.summary}\n\n${renderRejectedAsMarkdown(validated.rejected)}`
+      : parsed.summary
+    if (validated.rejected.length > 0) {
+      console.warn(
+        `[${tag}] ${validated.rejected.length}/${parsed.comments.length} inline comment(s) failed pre-validation; demoting to summary`,
+      )
+    }
+    const apiComments = validated.valid.map((c) => ({
       path: c.path,
       line: c.line,
       side: c.side ?? "RIGHT",
@@ -338,18 +366,25 @@ function postAsReview(input: ReviewInput): Poster {
         repo: input.repo,
         pull_number: input.prNumber,
         event: "COMMENT",
-        body: parsed.summary,
+        body: summary,
         comments: apiComments,
       })
       return
     } catch (err) {
-      // GitHub rejects the entire review (422) if any inline comment references
-      // a line outside the diff. Don't lose the review — retry with summary
-      // only, and append the inline findings as text so they're still visible.
+      // Even with pre-validation, GitHub may still 422 (subtle path/encoding
+      // mismatches, or our patch parser missing edge cases). Log the response
+      // body so we can diagnose, then fall back to summary-only with all
+      // inline findings (validated or not) appended as markdown.
       const status = (err as { status?: number }).status
-      if (status !== 422) throw err
+      const responseBody = (err as { response?: { data?: unknown } }).response?.data
+      if (status !== 422) {
+        console.error(
+          `[${tag}] createReview failed status=${status} body=${JSON.stringify(responseBody).slice(0, 1500)}`,
+        )
+        throw err
+      }
       console.warn(
-        `[${tag}] createReview rejected ${apiComments.length} inline comment(s) (422); retrying summary-only`,
+        `[${tag}] createReview rejected ${apiComments.length} inline comment(s) (422); response body: ${JSON.stringify(responseBody).slice(0, 1500)}`,
       )
       await octokit.rest.pulls.createReview({
         owner: input.owner,
@@ -360,6 +395,99 @@ function postAsReview(input: ReviewInput): Poster {
       })
     }
   }
+}
+
+type DiffLineMap = Map<string, { right: Map<number, string>; left: Map<number, string> }>
+
+async function fetchDiffLineMap(input: ReviewInput): Promise<DiffLineMap> {
+  const files = await octokit.paginate(octokit.rest.pulls.listFiles, {
+    owner: input.owner,
+    repo: input.repo,
+    pull_number: input.prNumber,
+    per_page: 100,
+  })
+  const map: DiffLineMap = new Map()
+  for (const f of files) {
+    const right = new Map<number, string>()
+    const left = new Map<number, string>()
+    if (f.patch) {
+      let rightLine = 0
+      let leftLine = 0
+      for (const line of f.patch.split("\n")) {
+        const hunkMatch = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/)
+        if (hunkMatch && hunkMatch[1] && hunkMatch[2]) {
+          leftLine = parseInt(hunkMatch[1], 10) - 1
+          rightLine = parseInt(hunkMatch[2], 10) - 1
+          continue
+        }
+        if (line.startsWith("+")) {
+          rightLine++
+          right.set(rightLine, line.slice(1))
+        } else if (line.startsWith("-")) {
+          leftLine++
+          left.set(leftLine, line.slice(1))
+        } else if (line.startsWith(" ")) {
+          rightLine++
+          leftLine++
+          right.set(rightLine, line.slice(1))
+          left.set(leftLine, line.slice(1))
+        }
+        // "\ No newline at end of file" — ignore
+      }
+    }
+    map.set(f.filename, { right, left })
+  }
+  return map
+}
+
+function validateInlineComments(
+  comments: InlineReviewComment[],
+  diffLines: DiffLineMap,
+  tag: string,
+): { valid: InlineReviewComment[]; rejected: Array<{ comment: InlineReviewComment; reason: string }> } {
+  const valid: InlineReviewComment[] = []
+  const rejected: Array<{ comment: InlineReviewComment; reason: string }> = []
+  for (const c of comments) {
+    const fileEntry = diffLines.get(c.path)
+    if (!fileEntry) {
+      rejected.push({ comment: c, reason: `path "${c.path}" is not in the PR diff` })
+      continue
+    }
+    const sideMap = (c.side ?? "RIGHT") === "LEFT" ? fileEntry.left : fileEntry.right
+    const actualCode = sideMap.get(c.line)
+    if (actualCode === undefined) {
+      rejected.push({
+        comment: c,
+        reason: `line ${c.line} (side=${c.side ?? "RIGHT"}) is not part of any diff hunk in ${c.path}`,
+      })
+      continue
+    }
+    if (c.code !== undefined && c.code.trim() !== actualCode.trim()) {
+      const expected = actualCode.trim().slice(0, 100)
+      const got = c.code.trim().slice(0, 100)
+      rejected.push({
+        comment: c,
+        reason: `code self-check failed at ${c.path}:${c.line}: diff has \`${expected}\`, model claimed \`${got}\``,
+      })
+      continue
+    }
+    valid.push(c)
+  }
+  for (const r of rejected) {
+    console.warn(`[${tag}]   inline-validation reject: ${r.reason}`)
+  }
+  return { valid, rejected }
+}
+
+function renderRejectedAsMarkdown(rejected: Array<{ comment: InlineReviewComment; reason: string }>): string {
+  const lines = ["## General findings (auto-demoted from inline due to pre-validation)", ""]
+  for (const r of rejected) {
+    const sev = r.comment.severity ? `**${r.comment.severity}** ` : ""
+    const firstLine = r.comment.body.split("\n")[0]?.replace(/^\*\*[^*]+\*\*:?\s*/, "") ?? ""
+    lines.push(`- ${sev}\`${r.comment.path}:${r.comment.line}\` — ${firstLine}`)
+    lines.push(`  - *(demoted: ${r.reason})*`)
+  }
+  return lines.join("\n")
 }
 
 function postAsLog(input: ReviewInput): Poster {
@@ -420,7 +548,8 @@ function parseReviewOutput(text: string, tag: string): ParsedReview {
     const side = cc.side === "LEFT" ? "LEFT" : "RIGHT"
     const severity =
       cc.severity === "Blocking" || cc.severity === "Non-blocking" || cc.severity === "Nit" ? cc.severity : undefined
-    comments.push({ path, line, side, severity, body })
+    const code = typeof cc.code === "string" ? cc.code : undefined
+    comments.push({ path, line, side, severity, body, code })
   }
   if (!summary && comments.length === 0) {
     console.warn(`[${tag}] agent JSON had neither summary nor valid comments; falling back to raw text`)
