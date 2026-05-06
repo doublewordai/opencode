@@ -29,6 +29,7 @@ import type {
   LanguageModelV3GenerateResult,
   LanguageModelV3StreamPart,
   LanguageModelV3StreamResult,
+  LanguageModelV3ToolCall,
 } from "@ai-sdk/provider";
 
 interface CreateDoublewordOptions {
@@ -129,8 +130,38 @@ function generateResultToStreamParts(
         parts.push({ type: "reasoning-end", id });
         break;
       }
+      case "tool-call": {
+        // Although LanguageModelV3ToolCall is a valid StreamPart variant on
+        // its own, the Vercel AI SDK's higher-level streamText() consumer
+        // ONLY recognises a tool call as a real tool call when it has been
+        // streamed as the tool-input-{start,delta,end} ceremony first. If
+        // we emit the LanguageModelV3ToolCall directly without the preamble,
+        // the SDK consumes it as an empty-content assistant turn and never
+        // dispatches the tool — causing opencode to never see a tool to
+        // execute, never accumulate a tool-result message, and effectively
+        // restart the agent loop with no grounding on every turn. This was
+        // the root cause of phase-2's three-different-model failures (see
+        // docs/doubleword.md "Phase 2 results — take 2"). Emit the full
+        // start/delta/end sequence with the complete pre-existing input
+        // serialised as a single delta, then pass the actual tool-call
+        // through unchanged.
+        const tc = c as LanguageModelV3ToolCall;
+        parts.push({
+          type: "tool-input-start",
+          id: tc.toolCallId,
+          toolName: tc.toolName,
+          providerExecuted: tc.providerExecuted,
+          dynamic: tc.dynamic,
+          providerMetadata: tc.providerMetadata,
+        });
+        if (tc.input && tc.input.length > 0) {
+          parts.push({ type: "tool-input-delta", id: tc.toolCallId, delta: tc.input });
+        }
+        parts.push({ type: "tool-input-end", id: tc.toolCallId });
+        parts.push(tc);
+        break;
+      }
       // The StreamPart union accepts these content types directly — pass through.
-      case "tool-call":
       case "tool-result":
       case "tool-approval-request":
       case "file":
