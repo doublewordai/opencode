@@ -260,6 +260,46 @@ The bot's review of PR #1047 (run on Cloud Run revision `pr-review-harness-00008
 
 **This is a strong pass signal for phase 1.** The agent loop on Doubleword's sync chat-completions inference produces actionable, structured PR reviews comparable to GitHub Copilot. Phases 2–4 will use this as the comparison baseline.
 
+### Phase 1 results — Copilot-pattern + async refactor + DeepSeek-V4-Flash
+
+After the second-iteration changes — research-heavy prompt, summary + inline-comment output (Copilot pattern), `prompt_async` + polling, `REVIEW_MODEL_ID` env-driven — we re-ran on `pr-review-harness-00013-rxn` with `REVIEW_MODEL_ID=deepseek-ai/DeepSeek-V4-Flash`:
+
+| Metric | Score |
+|---|---|
+| Direct hits | **11 / 24** (46%) |
+| Hits + partials | **15 / 24** (63%) |
+| Of the 7 Blocking-severity issues | **6 / 7** hit or partial (86%) |
+| False positives | 0 |
+| Bonus catches | 3 |
+| Inline comments posted | 16 |
+| End-to-end latency | 124 s (2 min 4 s) |
+
+**Per-issue scoring** (HIT = explicit + correct severity, PARTIAL = mentioned but mis-classified or different angle, MISS = not mentioned):
+
+Backend (`system_info.rs`): B1 HIT (summary general-findings: "must be behind authentication/authorization"), B2 MISS, B3 HIT, B4 HIT, B5 PARTIAL (severity downgraded to Non-blocking), B6 MISS (the unwrap-on-clock-skew angle was missed; the bot caught a *different* bug at the same line — see bonus catches), B7 MISS, B8 HIT, B9 MISS (the `println!` was flagged for leaking the token but not separately for violating the tracing convention), B10 PARTIAL (flagged as "ADMIN_TOKEN not standard config" — related but not the per-request env-read angle), B11 MISS, B12 HIT, B13 HIT (summary general-findings: "not yet registered in the router"). **6 hits + 2 partials + 5 misses out of 13.**
+
+Frontend (`UserNotes.tsx`): F1 HIT (both XSS sites — `:46` and `:56` — flagged independently), F2 HIT, F3 PARTIAL (severity upgraded to Blocking), F4 PARTIAL (severity upgraded to Blocking), F5 MISS, F6 HIT, F7 HIT, F8 MISS, F9 MISS, F10 MISS, F11 HIT. **5 hits + 2 partials + 4 misses out of 11.**
+
+**Bonus catches (3):**
+
+1. **`uptime_seconds` semantic bug** — The bot flagged that `SystemTime::now().duration_since(UNIX_EPOCH)` returns *seconds since the Unix epoch*, not process uptime. This is a different angle on the same line as ground-truth B6 (which targeted the `unwrap()` panic risk) and a real correctness bug not in our ground truth. The Qwen baseline also caught this independently.
+2. **`debug_payload` field duplication** — Pointed out that `debug_payload.rev` / `host_user` duplicate top-level fields (`version` / `host_user`).
+3. **`ADMIN_TOKEN` naming convention drift** — Beyond the per-request env-read angle (B10), the bot used a `grep` to discover that `ADMIN_TOKEN` doesn't appear elsewhere in the codebase and that the project's secret-management convention is `DWCTL_*` env vars routed through `Config.secret_key`. This is the kind of architectural insight the research-heavy prompt is *supposed* to produce — and would not have surfaced from the diff alone.
+
+**What the second iteration won:**
+
+- **Zero false positives** (vs. 1 in the original Qwen run). Every inline comment is a real issue.
+- **Research grounded in the codebase, not generic best-practice boilerplate.** The bot's research notes cite specific grep counts: *"Every single handler in the codebase uses `#[tracing::instrument(skip_all)]` (147 matches)"*, *"`#[utoipa::path(...)]` (143 matches)"*, *"the codebase stores its security secret via `config.secret_key` (read from `DWCTL_SECRET_KEY` env var / `config.yaml`). The env var `ADMIN_TOKEN` is not referenced anywhere else"*. That's the research-heavy prompt + tool loop earning its keep.
+- **Inline comments anchored to specific lines.** Reviewers see findings exactly where the issue lives — the GitHub Copilot review pattern. The Qwen baseline posted a single big summary comment.
+- **All 7 Blocking issues either hit or partial.** Same 6/7 ratio as the Qwen baseline; the only Blocking miss is B2 (hardcoded fallback secret) in both runs.
+
+**What it lost:**
+
+- Slight regression on direct hits (11/24 vs. 13/24). The Non-blocking correctness misses cluster in the frontend (F5 race, F8 SSR-unsafe localStorage, F9 `(d as any)` casts, F10 fresh-function-per-render) and the backend (B7 unwrap, B9 println-vs-tracing convention, B11 `_state` nit). These are subtler and the inline-only output format may have caused the bot to omit findings that didn't have an obvious anchor line. The Qwen baseline got several of these in its summary prose.
+- Latency 124s vs 72s — slower than the Qwen baseline despite a smaller / faster-tier model, because the research-heavy prompt drives more tool calls per review.
+
+**Net read:** the inline-comment + research-heavy pattern produces a *visibly higher-quality* review per finding (grounded, not boilerplate, posted Copilot-style on the right lines) at the cost of a few subtle Non-blocking misses. For real-PR use, we'd take this trade. Phases 2–4 will compare *both* iterations against the same ground truth.
+
 ---
 
 ## Production friction observed (running tally)
@@ -295,6 +335,7 @@ These are first-time-only mistakes, but each is a representative customer footgu
 - **`git fetch origin <base>:<base>` collision.** When the PR's base branch is the repo's default branch (which the clone already checks out as a local branch), git refuses to fetch into it. Dropped the local-dst part of the refspec so it just updates `origin/<base>`. Customer-side cloning + git plumbing is the customer's problem to get right.
 - **Per-workspace agent configuration.** opencode loads `agent` + `provider` config relative to the *workspace* directory passed via the `x-opencode-directory` header — not the server's startup cwd. The first review attempt failed with `Agent not found: "review". Available agents: build, explore, general, plan` because the cloned PR worktree didn't carry an `opencode.json`. Fix: copy `/app/opencode.json` into each cloned workdir before kicking off the session. This is a class of "agent framework configuration leaks across multiple file system locations" friction that a hosted tool loop avoids entirely.
 - **Cloud Run CPU throttling reaping mid-review.** Default Cloud Run only allocates CPU during request handling. Our shim returns `202` to GitHub immediately so the webhook doesn't retry, then runs the review work in the background — but with throttled CPU, that background work crawls, and Cloud Run reaps the instance as "idle" after ~3 minutes. The fix is `--no-cpu-throttling` (always-allocated CPU), which is more expensive. A platform-side tool loop running on Doubleword's infrastructure would have the right execution model for long-running work by default; customers paying Cloud Run's premium for "background work that runs at full speed" is a hidden tax on the client-side pattern.
+- **Large models can't finish a multi-tool-call review on the realtime tier.** With the research-heavy prompt and `steps: 100`, swapping the model to `moonshotai/Kimi-K2.6` (a much larger model than the Qwen baseline) produced an agent loop that ran for **>30 minutes without converging** even when every request went through the lowest-latency path Doubleword exposes — synchronous chat-completions on the realtime/priority tier, no batching, no flex routing, no background mode. Polling logs showed the session steadily accumulating messages (16 → 19 → 21 → 23 over half an hour) at ~78s per turn average; throughput slowed in the back half as context grew, and the agent never reached a "stop, write the summary" terminal. Two failure modes are tangled here: (1) **per-step latency** — large models are slow per token, and an agentic loop multiplies that latency by the step count; (2) **no early-termination signal** — the prompt asks for many tool loops, the model dutifully keeps researching, and there is no client-managed budget that says "you've gathered enough evidence — finalise". Both are *only visible because tool execution lives client-side*. A hosted Doubleword tool loop would (a) absorb per-step latency behind the platform's batching / scheduling rather than blocking a customer's webhook handler, and (b) expose declarative budgets (per-tool, per-call, total cost ceiling) that an agent could be configured against without the customer building an early-stop heuristic from scratch. Mitigation in this experiment: dropped to a faster model (`deepseek-ai/DeepSeek-V4-Flash`), which converged in 2 min 4 s — but the cost/quality dial *should* be a platform knob, not a customer-side model swap.
 - **HTTP idle-read timeouts kill long agent loops.** opencode's v1 `POST /session/:id/message` endpoint holds the HTTP connection open for the *entire* agentic loop and emits zero bytes until the loop completes. Bun's HTTP client has an internal ~5-min idle-read timeout (a `DOMException TimeoutError` fires at ~285s) that `AbortSignal.timeout(...)` can't override — they're independent timers. The phase-1 baseline never tripped this because Qwen + `steps:20` + a thin prompt converged in 72s; once we swapped to a slower model, raised the steps cap, and added a research-mandate prompt that drives many tool loops, total wall-time blew past the cap and the connection was killed every time. Fix: switch the shim to opencode's `prompt_async` endpoint (forks the loop into a background fiber, returns 204 immediately) and poll `GET /session/:id/message` for the assistant message's `time.completed`. Now no individual HTTP call is held open for long, so neither Bun's nor any intermediate proxy's idle cap matters. **This is exactly the kind of failure mode a server-side tool loop would never expose to a customer** — the entire "synchronous fetch held open for the duration of a multi-minute agent loop" pattern is a client-side concern. A hosted tool execution layer would absorb the duration of the loop internally and surface it as durable, observable steps via the Responses API (which is what phases 3 + 4 test for the inference path).
 
 (Phases 2–4 will append their own friction findings to this section.)
