@@ -377,6 +377,32 @@ This is itself a friction-tally entry: **model availability varies by inference 
 
 ---
 
+## Phase 2 results — autobatcher (flex tier, client-side batching)
+
+**Phase 2 fails at the integration layer, not at the latency-or-correctness layer the original hypothesis predicted.** Cloud Run revision `pr-review-harness-00017-scz` was deployed from the phase-2 image (`harness:phase-2`, with `createDoublewordAsync` re-exported from `@doubleword/vercel-ai` so opencode's factory loader picks up the autobatcher path). Trigger fired, opencode session created, first tool-loop step issued, and the upstream returned this within 8 seconds:
+
+```
+UnknownError: Streaming is not supported in batch mode.
+Use generateText() instead of streamText().
+```
+
+The failure is structural and unfixable at the configuration level:
+
+- opencode's agent loop calls **`streamText()`** for every model turn — that's the Vercel AI SDK's default for chat agents (see how `tool_call: true` is wired through the SDK).
+- `createDoublewordAsync` collects calls and submits them as a **batch**. Batches don't stream by definition; the wrapper rejects `streamText()` and asks for `generateText()` instead.
+
+So the very first call from opencode → wrapper blew up. Phase 2 didn't get to score *any* ground-truth issue, didn't get to run the agent loop at all, and didn't validate the original phase-2 hypothesis (*"client-side batching may be overwhelmed by parallel tool calls in opencode's loop"*) — because it never reached the loop.
+
+**This is a strictly stronger result than the original hypothesis predicted.** The phase-2 plan assumed the autobatcher would *work but possibly degrade* under load. Reality: it can't be used at all with an opencode-shaped agent. Three escape hatches, none free:
+
+1. **Patch opencode** to call `generateText()` instead of `streamText()` when the provider doesn't advertise streaming. Right answer architecturally, but a deep upstream change in a third-party agent runtime that you don't own.
+2. **Wrap the autobatcher in a fake-streaming `LanguageModelV1` adapter** — collect the `generateText()` response and emit it as a single chunk. Mid-complexity work in `packages/doubleword-async-wrapper/` (~30-60 min). Papers over the actual capability mismatch but produces a comparable benchmark number. Considered for revisit after phases 3 + 4.
+3. **Move to phase 3 (Open Responses API + flex)**, which streams over a long-held HTTP connection and is therefore compatible with opencode's `streamText` from the SDK side. This is what the experiment is moving on to.
+
+**Phase 2 friction-tally entry** added to the running list below.
+
+---
+
 ## Production friction observed (running tally)
 
 This section is the load-bearing payload of the experiment. Every piece of friction recorded here is something that *only exists because tool execution lives client-side*. A Doubleword-hosted server-side tool loop ([Multi-Tier Agentic Tools](https://linear.app/doubleword/project/multi-tier-agentic-tools-70de986f3f32)) could in principle ship `github_review_pr` as a hosted capability with most of this concealed inside the platform.
@@ -401,7 +427,11 @@ These are first-time-only mistakes, but each is a representative customer footgu
 - **Large models can't finish a multi-tool-call review on the realtime tier.** With the research-heavy prompt and `steps: 100`, swapping the model to `moonshotai/Kimi-K2.6` (a much larger model than the Qwen baseline) produced an agent loop that ran for **>30 minutes without converging** even when every request went through the lowest-latency path Doubleword exposes — synchronous chat-completions on the realtime/priority tier, no batching, no flex routing, no background mode. Polling logs showed the session steadily accumulating messages (16 → 19 → 21 → 23 over half an hour) at ~78s per turn average; throughput slowed in the back half as context grew, and the agent never reached a "stop, write the summary" terminal. Two failure modes are tangled here: (1) **per-step latency** — large models are slow per token, and an agentic loop multiplies that latency by the step count; (2) **no early-termination signal** — the prompt asks for many tool loops, the model dutifully keeps researching, and there is no client-managed budget that says "you've gathered enough evidence — finalise". Both are *only visible because tool execution lives client-side*. A hosted Doubleword tool loop would (a) absorb per-step latency behind the platform's batching / scheduling rather than blocking a customer's webhook handler, and (b) expose declarative budgets (per-tool, per-call, total cost ceiling) that an agent could be configured against without the customer building an early-stop heuristic from scratch. Mitigation in this experiment: dropped to a faster model (`deepseek-ai/DeepSeek-V4-Flash`), which converged in 2 min 4 s — but the cost/quality dial *should* be a platform knob, not a customer-side model swap.
 - **HTTP idle-read timeouts kill long agent loops.** opencode's v1 `POST /session/:id/message` endpoint holds the HTTP connection open for the *entire* agentic loop and emits zero bytes until the loop completes. Bun's HTTP client has an internal ~5-min idle-read timeout (a `DOMException TimeoutError` fires at ~285s) that `AbortSignal.timeout(...)` can't override — they're independent timers. The phase-1 baseline never tripped this because Qwen + `steps:20` + a thin prompt converged in 72s; once we swapped to a slower model, raised the steps cap, and added a research-mandate prompt that drives many tool loops, total wall-time blew past the cap and the connection was killed every time. Fix: switch the shim to opencode's `prompt_async` endpoint (forks the loop into a background fiber, returns 204 immediately) and poll `GET /session/:id/message` for the assistant message's `time.completed`. Now no individual HTTP call is held open for long, so neither Bun's nor any intermediate proxy's idle cap matters. **This is exactly the kind of failure mode a server-side tool loop would never expose to a customer** — the entire "synchronous fetch held open for the duration of a multi-minute agent loop" pattern is a client-side concern. A hosted tool execution layer would absorb the duration of the loop internally and surface it as durable, observable steps via the Responses API (which is what phases 3 + 4 test for the inference path).
 
-(Phases 2–4 will append their own friction findings to this section.)
+### Phase 2 (autobatcher / flex tier) — design-level friction
+
+- **Streaming-vs-batching capability mismatch is fatal at integration, not at scale.** Phase 2 routes inference through `createDoublewordAsync` from `@doubleword/vercel-ai` — the autobatcher / flex-tier provider. opencode's agent loop calls `streamText()` for every model turn (the Vercel AI SDK's default for chat agents), but the autobatcher rejects streaming with `UnknownError: Streaming is not supported in batch mode. Use generateText() instead of streamText().`. The very first call from opencode → wrapper blew up; the agent loop never started; phase 2 never scored a single ground-truth issue. **The original phase-2 hypothesis assumed graceful degradation under load — actual failure was the impossibility of integration at all.** This is one of the cleanest demonstrations the experiment will produce of why client-side tool execution is the wrong shape for the long tail of customer-chosen agent SDKs: the customer's choice of agent runtime (opencode) hard-codes the response shape (streaming) it expects from the model layer; the customer's choice of inference tier (autobatcher / flex) hard-codes the response shape (batched, non-streaming) it returns. There is no configuration knob that bridges them — the bridge is *code*, written by the customer, against two third-party SDKs neither of which they own. Three workaround paths considered: (a) patch opencode to call `generateText` when the provider doesn't advertise streaming — right architectural fix but in someone else's codebase; (b) wrap the autobatcher in a fake-streaming `LanguageModelV1` adapter — papers over a real capability mismatch but produces a comparable phase-2 number; (c) move to phase 3 (Open Responses API + flex), which streams over a long-held connection and avoids the mismatch by design. We chose (c) for the experiment continuation; (b) is on the table to revisit after phases 3 + 4 land. **A platform-side tool loop owns the model→agent capability negotiation entirely** — the customer never sees streaming-vs-batching as an integration concern, because Doubleword's infrastructure handles whichever shape each tier produces and exposes a single durable-step API to the agent (which is what the [Multi-Tier Agentic Tools](https://linear.app/doubleword/project/multi-tier-agentic-tools-70de986f3f32) parent project is building).
+
+(Phases 3–4 will append their own friction findings to this section.)
 
 ---
 
