@@ -47,13 +47,20 @@ const env = {
   // per-message override stay aligned automatically. Required — fail loud if
   // unset rather than registering an empty model and 404-ing at runtime.
   REVIEW_MODEL_ID: requireEnv("REVIEW_MODEL_ID"),
-  // 30 min is well under the Cloud Run 60-min request cap and well above the
-  // observed range of long research-heavy reviews. Bun's default fetch has no
-  // explicit timeout but the platform appears to drop the connection at ~5 min,
-  // which we hit when steps=100 + a research-mandate prompt produced enough
-  // tool loops to exceed it. Fail loud past 30 min — anything longer is a
-  // runaway loop, not legitimate work.
-  OPENCODE_FETCH_TIMEOUT_MS: Number(process.env.OPENCODE_FETCH_TIMEOUT_MS ?? 30 * 60 * 1000),
+  // Per-HTTP-call safety. Each call to opencode is now trivial (POST returns
+  // 204 immediately; GET messages returns the current state) so 30s is plenty.
+  // Bun's fetch has an internal ~5-min idle-read default that we can't override
+  // with AbortSignal.timeout — that's why review used to time out at ~5 min
+  // when the v1 /message endpoint was synchronous. The async refactor below
+  // routes around that by never holding any one request open for long.
+  OPENCODE_FETCH_TIMEOUT_MS: Number(process.env.OPENCODE_FETCH_TIMEOUT_MS ?? 30 * 1000),
+  // Overall ceiling on the agent loop. 30 min is well under the Cloud Run
+  // 60-min request cap and well above the observed range of legitimate
+  // research-heavy reviews. Past this, the loop has likely stalled.
+  REVIEW_TIMEOUT_MS: Number(process.env.REVIEW_TIMEOUT_MS ?? 30 * 60 * 1000),
+  // Polling interval when waiting for the assistant message to complete.
+  // 5s is fine — the agent loop runs in seconds-to-minutes, not milliseconds.
+  REVIEW_POLL_INTERVAL_MS: Number(process.env.REVIEW_POLL_INTERVAL_MS ?? 5 * 1000),
   // opencode loads agent + provider config from this file relative to the
   // workspace directory (the x-opencode-directory header value). We copy this
   // file into each cloned PR worktree so the `review` agent + Doubleword
@@ -301,7 +308,7 @@ async function runReview(input: ReviewInput, opencodeServerUrl: string, post: Po
     })
     // Make the review agent + Doubleword provider visible to the session.
     await copyFile(env.OPENCODE_CONFIG_PATH, path.join(workdir, "opencode.json"))
-    const reviewText = await runReviewSession({ directory: workdir, opencodeServerUrl, ...input })
+    const reviewText = await runReviewSession({ directory: workdir, opencodeServerUrl, tag, ...input })
     if (!reviewText) {
       console.error(`[${tag}] no review text returned from opencode`)
       return
@@ -469,16 +476,36 @@ function runCmd(cmd: string, args: string[], cwd: string): Promise<void> {
   })
 }
 
+type MessageInfo = {
+  role: "user" | "assistant"
+  time?: { created: number; completed?: number }
+  error?: { message?: string; name?: string } | unknown
+}
+
+type MessagePart = { type: string; text?: string }
+
+type MessageWithParts = { info: MessageInfo; parts: MessagePart[] }
+
 async function runReviewSession(input: {
   directory: string
   opencodeServerUrl: string
   prTitle: string
   prNumber: number
   baseBranch: string
+  tag: string
 }): Promise<string | null> {
-  // Sessions are bare; agent + model are bound per-message via the v1
-  // /session/:id/message endpoint, which returns the assistant message
-  // synchronously with all its parts attached.
+  // Two-phase, fully asynchronous flow. We don't use the v1 POST
+  // /session/:id/message endpoint because it holds the HTTP connection open
+  // for the entire agent loop, and Bun's fetch client has an internal ~5-min
+  // idle-read timeout we can't override (AbortSignal.timeout is independent).
+  // For research-heavy reviews with many tool loops, the loop exceeds 5 min
+  // and the connection is killed mid-review.
+  //
+  // Instead: POST /session/:id/prompt_async, which forks the prompt into a
+  // background fiber and returns 204 immediately. We then poll
+  // GET /session/:id/message until the assistant message has time.completed
+  // set (or info.error if it failed). Each individual HTTP call is short, so
+  // the idle-read cap is never reached.
   const session = await opencode<{ id: string }>(input.opencodeServerUrl, "/session", {
     method: "POST",
     directory: input.directory,
@@ -491,13 +518,10 @@ async function runReviewSession(input: {
     `Run \`git log ${input.baseBranch}..HEAD --stat\` and \`git diff ${input.baseBranch}...HEAD\` to find the change set, read relevant files for context, and produce a complete review comment as your final response per your system instructions.`,
   ].join("\n\n")
 
-  const reply = await opencode<{
-    parts?: Array<{ type: string; text?: string }>
-    success?: boolean
-    error?: unknown
-  }>(input.opencodeServerUrl, `/session/${session.id}/message`, {
+  await opencode<void>(input.opencodeServerUrl, `/session/${session.id}/prompt_async`, {
     method: "POST",
     directory: input.directory,
+    expect: 204,
     body: {
       agent: env.REVIEW_AGENT,
       model: { providerID: env.REVIEW_MODEL_PROVIDER, modelID: env.REVIEW_MODEL_ID },
@@ -505,10 +529,54 @@ async function runReviewSession(input: {
     },
   })
 
-  if (!reply.parts) {
-    throw new Error(`opencode session returned no parts; envelope: ${JSON.stringify(reply).slice(0, 500)}`)
+  return await pollForAssistantReply({
+    opencodeServerUrl: input.opencodeServerUrl,
+    directory: input.directory,
+    sessionID: session.id,
+    tag: input.tag,
+  })
+}
+
+async function pollForAssistantReply(input: {
+  opencodeServerUrl: string
+  directory: string
+  sessionID: string
+  tag: string
+}): Promise<string | null> {
+  const deadline = Date.now() + env.REVIEW_TIMEOUT_MS
+  let attempt = 0
+  while (Date.now() < deadline) {
+    attempt++
+    const messages = await opencode<MessageWithParts[]>(
+      input.opencodeServerUrl,
+      `/session/${input.sessionID}/message`,
+      { method: "GET", directory: input.directory },
+    )
+    // The session is fresh, so there's at most one assistant message — the
+    // one for our prompt. Look at the last assistant message either way, in
+    // case opencode ever inserts intermediate ones.
+    const assistant = [...messages].reverse().find((m) => m.info.role === "assistant")
+    if (assistant) {
+      if (assistant.info.error) {
+        throw new Error(
+          `opencode session ${input.sessionID} ended in error: ${JSON.stringify(assistant.info.error).slice(0, 500)}`,
+        )
+      }
+      if (assistant.info.time?.completed) {
+        const text = [...assistant.parts].reverse().find((p) => p.type === "text")?.text
+        return text ?? null
+      }
+    }
+    if (attempt % 12 === 1) {
+      console.log(
+        `[${input.tag}] still waiting for assistant reply (${Math.round((Date.now() - (deadline - env.REVIEW_TIMEOUT_MS)) / 1000)}s elapsed, ${messages.length} message(s))`,
+      )
+    }
+    await new Promise((r) => setTimeout(r, env.REVIEW_POLL_INTERVAL_MS))
   }
-  return [...reply.parts].reverse().find((p) => p.type === "text")?.text ?? null
+  throw new Error(
+    `opencode session ${input.sessionID} did not complete within REVIEW_TIMEOUT_MS=${env.REVIEW_TIMEOUT_MS}ms`,
+  )
 }
 
 async function opencode<T = unknown>(
