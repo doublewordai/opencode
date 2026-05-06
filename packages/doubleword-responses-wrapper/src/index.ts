@@ -118,11 +118,26 @@ export function createDoubleword(opts: DoublewordResponsesOptions = {}) {
       lastJson = await pollRes.json();
     }
 
+    // Surface upstream terminal status to the SDK rather than silently
+    // synthesizing a 200. Without this, "failed"/"incomplete"/etc. look like
+    // an empty success — the SDK parses the response, finds no usable
+    // content, and the agent loop sees an empty assistant message rather
+    // than a real error. Map non-completed terminals to 502 with the
+    // failure body so the SDK throws and the error propagates.
+    const terminal: string | undefined = lastJson?.status;
+    const ok = terminal === "completed";
+    const status = ok ? 200 : 502;
+    if (!ok) {
+      console.error(
+        `[doubleword-responses-wrapper] response ${responseId} ended in non-completed terminal status=${terminal}: ${JSON.stringify(lastJson).slice(0, 800)}`,
+      );
+    }
     return new Response(JSON.stringify(lastJson), {
-      status: 200,
+      status,
       headers: {
         "content-type": "application/json",
         "x-doubleword-background-poll": "true",
+        "x-doubleword-terminal-status": terminal ?? "unknown",
       },
     });
   };
