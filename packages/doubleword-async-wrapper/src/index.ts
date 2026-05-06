@@ -49,8 +49,18 @@ export function createDoubleword(opts: CreateDoublewordOptions = {}) {
   // 1h flex tier the README documents. We want the 1h flex tier here, so
   // override explicitly. (Upstream bug to follow up on with the
   // @doubleword/vercel-ai maintainers.)
+  //
+  // batchSize=1 + batchWindowSeconds=1 eliminate the autobatcher's sequential-
+  // loop overhead. opencode's agent loop is strictly sequential (each turn
+  // waits for the previous turn's tool result), so there are never multiple
+  // concurrent calls to batch together — the default batchWindowSeconds=10
+  // would just add 10s of dead waiting per turn. Submitting immediately
+  // (batchSize=1, batchWindowSeconds=1) makes the autobatcher behave like a
+  // pass-through to the flex/async tier.
   const inner = createDoublewordAsync({
     completionWindow: "1h",
+    batchSize: 1,
+    batchWindowSeconds: 1,
     ...opts,
   });
 
