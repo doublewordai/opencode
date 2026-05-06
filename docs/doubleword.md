@@ -403,6 +403,33 @@ So the very first call from opencode → wrapper blew up. Phase 2 didn't get to 
 
 ---
 
+## Phase 3 results — Open Responses API + service_tier=flex (no background)
+
+**Phase 3 fails at a different integration boundary than phase 2 — but with strikingly similar shape: the customer's chosen agent SDK and the chosen inference path disagree on response semantics, and neither is configurable to bridge the gap.** Cloud Run revision `pr-review-harness-00018-t9x` was deployed from the phase-3 image (`harness:phase-3`, with `createDoubleword` re-implemented over `@ai-sdk/openai`'s `provider.responses(...)` and a `wrappedFetch` that injects `service_tier=flex` into every POST `/v1/responses` body before it leaves the process). Trigger fired, opencode session created, first tool-loop step issued, and the upstream returned this within 8 seconds:
+
+```
+UnknownError: Type validation failed:
+  Value: {"id":"resp_7bfc72dd-…","object":"response","status":"in_progress"}.
+  Error: invalid_union, expected "response.output_text.delta" etc.
+```
+
+What's happening: Doubleword's flex-tier Responses API returns an **"in-progress" response envelope** as its initial reply (`status: "in_progress"`, content not yet generated). The `@ai-sdk/openai` provider's response-streaming Zod validator doesn't recognize that envelope — it expects OpenAI's specific SSE delta event shape (`response.output_text.delta`, `response.output_text.done`, etc.) and rejects the envelope as `invalid_union` on the `type` field.
+
+In other words: the flex tier is implicitly async — you fire the request, get a `resp_*` ID back, then either subscribe to events or poll the `/v1/responses/<id>` endpoint until `status` flips to `completed`. The Vercel AI SDK's `@ai-sdk/openai` Responses provider only knows synchronous-streaming semantics. **The flex tier and the SDK disagree on whether responses are streaming or async, and neither is configurable to bridge the gap.**
+
+Same structural-integration failure as phase 2, at a different boundary:
+
+| Phase | Failure boundary |
+|---|---|
+| 2 | Agent SDK assumed streaming; autobatcher provider rejected `streamText()` and demanded `generateText()` |
+| 3 | SDK's responses validator assumed SSE deltas; flex tier returned an in-progress envelope without delta events |
+
+Phase 4 (`background=true` with explicit polling on `GET /v1/responses/<id>`) is *designed* exactly for this in-progress-envelope shape — fire-and-poll instead of streaming-or-batch. So phase 4 should sidestep both the streaming-validator mismatch (no streaming events expected) and the batch-mode mismatch (no batch involved either). **Strong hypothesis: phase 4 will be the first multi-tier path that actually works end-to-end with the customer-side stack.**
+
+Phase-3 friction-tally entry added to the running list below.
+
+---
+
 ## Production friction observed (running tally)
 
 This section is the load-bearing payload of the experiment. Every piece of friction recorded here is something that *only exists because tool execution lives client-side*. A Doubleword-hosted server-side tool loop ([Multi-Tier Agentic Tools](https://linear.app/doubleword/project/multi-tier-agentic-tools-70de986f3f32)) could in principle ship `github_review_pr` as a hosted capability with most of this concealed inside the platform.
@@ -431,7 +458,11 @@ These are first-time-only mistakes, but each is a representative customer footgu
 
 - **Streaming-vs-batching capability mismatch is fatal at integration, not at scale.** Phase 2 routes inference through `createDoublewordAsync` from `@doubleword/vercel-ai` — the autobatcher / flex-tier provider. opencode's agent loop calls `streamText()` for every model turn (the Vercel AI SDK's default for chat agents), but the autobatcher rejects streaming with `UnknownError: Streaming is not supported in batch mode. Use generateText() instead of streamText().`. The very first call from opencode → wrapper blew up; the agent loop never started; phase 2 never scored a single ground-truth issue. **The original phase-2 hypothesis assumed graceful degradation under load — actual failure was the impossibility of integration at all.** This is one of the cleanest demonstrations the experiment will produce of why client-side tool execution is the wrong shape for the long tail of customer-chosen agent SDKs: the customer's choice of agent runtime (opencode) hard-codes the response shape (streaming) it expects from the model layer; the customer's choice of inference tier (autobatcher / flex) hard-codes the response shape (batched, non-streaming) it returns. There is no configuration knob that bridges them — the bridge is *code*, written by the customer, against two third-party SDKs neither of which they own. Three workaround paths considered: (a) patch opencode to call `generateText` when the provider doesn't advertise streaming — right architectural fix but in someone else's codebase; (b) wrap the autobatcher in a fake-streaming `LanguageModelV1` adapter — papers over a real capability mismatch but produces a comparable phase-2 number; (c) move to phase 3 (Open Responses API + flex), which streams over a long-held connection and avoids the mismatch by design. We chose (c) for the experiment continuation; (b) is on the table to revisit after phases 3 + 4 land. **A platform-side tool loop owns the model→agent capability negotiation entirely** — the customer never sees streaming-vs-batching as an integration concern, because Doubleword's infrastructure handles whichever shape each tier produces and exposes a single durable-step API to the agent (which is what the [Multi-Tier Agentic Tools](https://linear.app/doubleword/project/multi-tier-agentic-tools-70de986f3f32) parent project is building).
 
-(Phases 3–4 will append their own friction findings to this section.)
+### Phase 3 (Open Responses API + flex tier, no background) — design-level friction
+
+- **Streaming validator vs async-envelope mismatch is fatal at integration, not at scale.** Phase 3 routes inference through `@ai-sdk/openai`'s `provider.responses(...)` with `service_tier=flex` injected into every request body. opencode's agent loop calls `streamText()`, which the Vercel AI SDK turns into a streaming POST `/v1/responses` and then validates each chunk of the SSE stream against a Zod schema enumerating OpenAI's specific event types (`response.output_text.delta`, `response.output_text.done`, etc.). Doubleword's flex tier instead returns a single **"in-progress" response envelope** (`{id: "resp_...", object: "response", status: "in_progress"}`) as the initial wire payload — the actual content arrives only via subsequent polling of `GET /v1/responses/<id>`. The SDK's validator rejected the envelope as `invalid_union` on the `type` field within ~8s. The agent loop never started, no ground-truth issue scored. **A second, structurally-identical failure to phase 2 at a different layer:** in phase 2 the streaming/batch axis didn't match between SDK and provider; in phase 3 the streaming/async-envelope axis doesn't match between SDK and provider. The customer is given a third-party agent runtime, a third-party AI SDK, and a third-party inference tier — and asked to make them agree on whether responses are streamed, batched, or polled. There is no shared protocol; only convention, and conventions diverge across tiers. The fix exists (phase 4: fire-and-poll explicitly with `background=true`), but it requires the customer to write yet another wrapper that knows the precise polling protocol of *this specific provider*. **A platform-side tool loop would absorb this entirely** — the customer talks to one durable-step API regardless of how each tier under the hood wants to deliver tokens.
+
+(Phase 4 will append its own friction findings to this section.)
 
 ---
 
