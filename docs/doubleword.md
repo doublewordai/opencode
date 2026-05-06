@@ -334,6 +334,47 @@ Frontend: F1 HIT (both XSS sites), F2 HIT, F3 PARTIAL (severity upgraded), F4 PA
 
 For PR review specifically, **Flash is the better tool**: it's 3× faster, catches more easy issues, and still produces a strong Blocking-issue hit-rate (6/7 vs Pro's 5/7). Pro might be the right shape for *architecture review* or *design-doc review* where depth-over-breadth is the right trade — but for a per-PR gate, breadth-over-depth wins. **Net result: switching to a "more powerful" model did not produce a better review for this task — it produced a different and arguably worse one.**
 
+### Phase 1 results — Copilot-pattern + async refactor + Qwen3.5-397B
+
+Re-running the original phase-1 model (`Qwen/Qwen3.5-397B-A17B-FP8`) on the *new* harness (research-heavy prompt + Copilot-pattern + async polling) isolates the harness changes from the model swap. Cloud Run revision `pr-review-harness-00015-8jx`:
+
+| Metric | Qwen 397B (new harness) | DeepSeek-Flash | DeepSeek-Pro | Qwen baseline (old harness) |
+|---|---|---|---|---|
+| Direct hits | **14 / 24** (58%) | 11 / 24 | 6 / 24 | 13 / 24 |
+| Hits + partials | **17 / 24** (71%) | 15 / 24 (63%) | 13 / 24 (54%) | 16 / 24 (67%) |
+| Of the 7 Blocking-severity issues | **7 / 7** (100%) | 6 / 7 | 5 / 7 | 6 / 7 |
+| False positives | 0 | 0 | 0 | 1 |
+| Bonus catches | 4 | 3 | 5 | 3 |
+| Inline comments posted | **20** | 16 | 15 | 0 (single summary) |
+| End-to-end latency | 262 s (4 min 22 s) | 124 s | 354 s | 72 s |
+
+**Per-issue scoring (Qwen 397B + new harness):**
+
+Backend: B1 HIT (inline `:19` explicitly: *"No authentication check on this handler — publicly accessible endpoint. Compare to `config.rs:80` which uses `CurrentUser` extractor"*), B2 HIT (inline `:20` explicitly catches the well-known fallback secret: *"the fallback `admin-default-token` suggests this could be a backdoor"* — **the only run of any model to catch this**), B3 HIT, B4 HIT (`:23` — *"Uses println! for logging — bypasses structured logging and may leak credentials"*), B5 HIT, B6 MISS (the unwrap-on-clock-skew angle was missed; the bot caught the epoch-as-uptime semantic bug at the same line as a bonus), B7 MISS, B8 HIT, B9 PARTIAL (covered at `:23` but severity upgraded to Blocking), B10 HIT, B11 MISS, B12 HIT, B13 HIT (inline `:1` on the `#![allow(dead_code)]` smell + summary). **9 hits + 1 partial + 3 misses out of 13.**
+
+Frontend: F1 HIT (both XSS sites), F2 HIT, F3 PARTIAL (severity upgraded), F4 HIT (correct severity), F5 MISS, F6 HIT (correct severity — *"failed requests will cause unhandled promise rejections and leave the UI in a loading state forever"*), F7 PARTIAL (severity upgraded), F8 MISS, F9 MISS, F10 MISS, F11 HIT (`:38` — *"if the API call fails, the UI is now out of sync with the server"*). **5 hits + 2 partials + 4 misses out of 11.**
+
+**Bonus catches (4):**
+1. `#![allow(dead_code)]` at module scope (also caught by Pro).
+2. `debug_payload` reframed as deployment-topology disclosure rather than mere field duplication — i.e. a security finding, not a code-cleanup one.
+3. **`env!("CARGO_PKG_VERSION")` runtime/compile-time mismatch** — *novel*, caught by no other model. Notes that if the binary is built once and deployed multiple times with different configs, the reported version may be inaccurate.
+4. Uptime epoch-as-uptime semantic bug.
+
+**The headline:** Qwen 397B with the new harness is the strongest model run we've tested.
+
+- **7 / 7 on Blocking-severity** — *the only run of any model to catch B2*, the hardcoded fallback `"admin-default-token"` secret. Every other run (Qwen baseline, DeepSeek-Flash, DeepSeek-Pro) missed this.
+- **+2 ground-truth issues vs Flash** for ~2× the latency (262s vs 124s). For a per-PR gate, the trade is worth it.
+- **+1 ground-truth issue vs the original Qwen baseline** despite the harness now being inline-only — i.e. the research-heavy prompt + tool-loop budget is buying real coverage, not just rearranging existing findings into inline form.
+- **0 false positives.**
+
+This run is the strongest evidence so far that **harness improvements compound with model capability** — the same model that scored 13/24 (54%) on the old single-summary harness scored 17/24 (71%) on the new Copilot-pattern + research-heavy harness. The model didn't get smarter; the harness got better at directing it.
+
+### Phase 1 — Qwen3.6-35B blocked at the realtime tier
+
+We attempted to also test `Qwen/Qwen3.6-35B-A3B-FP8` (a smaller, fewer-active-params Qwen 3.6 model) as a faster-and-cheaper option. Doubleword returned **HTTP 403 Forbidden** for our API key on the realtime / synchronous chat-completions path. The model exists (a 404 would say so) but is gated to a different tier. The opencode-side error surfaced cleanly via the new async polling path — `assistant.info.error` was set to the upstream APIError envelope, the shim threw, and we logged a structured failure within ~5s of the trigger.
+
+This is itself a friction-tally entry: **model availability varies by inference tier in ways the customer's harness has to handle.** A customer building a multi-model client-side agentic app has to (a) know which models are available on which tier, (b) gracefully fall back when a model is gated for the tier they're using, and (c) keep that mapping current as the provider's tier-gating policy evolves. A platform-side tool loop that owns model selection on the customer's behalf would absorb this entirely. We will likely have access to this model on the autobatcher (flex) path tested in phase 2 — if so, that's an additional data point for "the platform should expose models uniformly across tiers, or the agent should know which tier each model lives on".
+
 ---
 
 ## Production friction observed (running tally)
