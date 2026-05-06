@@ -360,21 +360,18 @@ function postAsReview(input: ReviewInput): Poster {
       side: c.side ?? "RIGHT",
       body: c.body,
     }))
+    const reviewArgs = {
+      owner: input.owner,
+      repo: input.repo,
+      pull_number: input.prNumber,
+      event: "COMMENT" as const,
+      body: summary,
+      comments: apiComments,
+    }
     try {
-      await octokit.rest.pulls.createReview({
-        owner: input.owner,
-        repo: input.repo,
-        pull_number: input.prNumber,
-        event: "COMMENT",
-        body: summary,
-        comments: apiComments,
-      })
+      await octokit.rest.pulls.createReview(reviewArgs)
       return
     } catch (err) {
-      // Even with pre-validation, GitHub may still 422 (subtle path/encoding
-      // mismatches, or our patch parser missing edge cases). Log the response
-      // body so we can diagnose, then fall back to summary-only with all
-      // inline findings (validated or not) appended as markdown.
       const status = (err as { status?: number }).status
       const responseBody = (err as { response?: { data?: unknown } }).response?.data
       if (status !== 422) {
@@ -383,9 +380,33 @@ function postAsReview(input: ReviewInput): Poster {
         )
         throw err
       }
-      console.warn(
-        `[${tag}] createReview rejected ${apiComments.length} inline comment(s) (422); response body: ${JSON.stringify(responseBody).slice(0, 1500)}`,
-      )
+      // Inspect the 422 body. GitHub sometimes 422s with
+      // "An internal error occurred, please try again." — that's a transient
+      // server-side hiccup, not a request-payload problem (and is exactly what
+      // 5xx normally is in well-designed APIs). The body literally tells us to
+      // retry; do it once with a short backoff before falling back.
+      const bodyText = JSON.stringify(responseBody)
+      const isTransient = /internal error|please try again|try again later/i.test(bodyText)
+      if (isTransient) {
+        console.warn(
+          `[${tag}] createReview 422 looks transient ("${bodyText.slice(0, 200)}"); retrying once after 2s`,
+        )
+        await new Promise((r) => setTimeout(r, 2000))
+        try {
+          await octokit.rest.pulls.createReview(reviewArgs)
+          return
+        } catch (err2) {
+          const status2 = (err2 as { status?: number }).status
+          const body2 = (err2 as { response?: { data?: unknown } }).response?.data
+          console.warn(
+            `[${tag}] retry also failed status=${status2} body=${JSON.stringify(body2).slice(0, 800)}; falling back to summary-only`,
+          )
+        }
+      } else {
+        console.warn(
+          `[${tag}] createReview rejected ${apiComments.length} inline comment(s) (422, non-transient); body: ${bodyText.slice(0, 1500)}`,
+        )
+      }
       await octokit.rest.pulls.createReview({
         owner: input.owner,
         repo: input.repo,
