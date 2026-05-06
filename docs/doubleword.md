@@ -463,7 +463,7 @@ With the wrapper architecture sound and the batch tuning right, we ran four mode
 
 | Model | Phase 1 (chat-completions, realtime) | Phase 2 (autobatcher → fake-stream → opencode) |
 |---|---|---|
-| `Qwen/Qwen3.5-397B-A17B-FP8` | 17/24 hits+partials, 7/7 Blocking, 4m 22s | (running — final apples-to-apples in flight) |
+| `Qwen/Qwen3.5-397B-A17B-FP8` | 17/24 hits+partials, 7/7 Blocking, 4m 22s | **20m 36s, 46 messages, free-form text (no JSON block), createReview 422, 0 inline comments posted** |
 | `Qwen/Qwen3.6-35B-A3B-FP8` | (blocked — realtime-tier 403) | 9 messages, no JSON output, "no review text" |
 | `deepseek-ai/DeepSeek-V4-Flash` | 15/24, 6/7 Blocking, 2m 4s | (skipped pending 397B baseline) |
 | `deepseek-ai/DeepSeek-V4-Pro` | 13/24, 5/7 Blocking, 5m 54s | 7m 15s, **single 7-character response: `网络错误，正在重试...`** ("Network error, retrying...") posted as the entire review |
@@ -472,7 +472,24 @@ With the wrapper architecture sound and the batch tuning right, we ran four mode
 
 This is a strong signal that **the response shape coming back from the autobatcher path materially differs from chat-completions in ways that confuse OpenAI-protocol-expecting models** — most likely tool-call structures being dropped or reshaped during the batch submit/poll dance. Worth investigating upstream: does the autobatcher preserve `tool_calls` on assistant message responses, or does it serialize the assistant content to text-only? If the latter, models that emit a tool call see only the text echo of their own attempt come back, interpret it as a failed call ("network error"), and abandon the loop.
 
-**Phase-2 friction-tally entries (additional)** added to the running list below. Final 397B benchmark to follow once the in-flight run completes.
+**Phase-2 friction-tally entries (additional)** added to the running list below.
+
+**Final 397B apples-to-apples** (Cloud Run revision `pr-review-harness-00026-zkq`, model `Qwen/Qwen3.5-397B-A17B-FP8`, autobatcher path with the fake-stream shim and `batchSize=1, batchWindowSeconds=1, completionWindow="1h"`):
+
+| Metric | Phase 1 + Qwen 397B | Phase 2 + Qwen 397B |
+|---|---|---|
+| End-to-end latency | 4 min 22 s | **20 min 36 s (4.7×)** |
+| Messages in agent loop | 36 | 46 |
+| Per-turn average | ~7 s | ~27 s |
+| Direct hits | 14 / 24 (58%) | **0 / 24 (0%)** |
+| Hits + partials | 17 / 24 (71%) | **0 / 24 (0%)** |
+| Of 7 Blocking | 7 / 7 (100%) | 0 / 7 (0%) |
+| Inline comments posted | 20 | **0** |
+| Outcome | Clean structured JSON, posted as Copilot-pattern review | **Free-form text, no JSON block, GitHub createReview 422, summary-only retry also failed, no review posted** |
+
+The same model that scored 17/24 + 7/7 Blocking + 20 inline comments in 4m 22s on phase 1 produced **zero useful output** on phase 2 in 20m 36s. The agent loop converged (46 messages = many tool turns) but the final assistant message was free-form prose rather than the JSON block the prompt required. With three model attempts (35B → empty XML, DeepSeek-Pro → 7-character "Network error" Chinese text, Qwen 397B → unstructured prose) all failing the same kind of format-following collapse, **the conclusion is that the autobatcher path materially perturbs model behavior across the board — not a per-model issue**. The wrapper architecture is sound; the inference path itself is broken for agent-loop workloads.
+
+**Phase 2 verdict:** the autobatcher path is unfit for client-side multi-step agentic workloads with current Doubleword infrastructure. It's not a configuration problem or a wrapper problem — same prompt, same harness, same model gives radically different (and useless) output through the autobatcher vs chat-completions. Worth a deeper investigation upstream into how the autobatcher's submit/poll/return cycle interacts with `tool_calls`, response format adherence, and the model's interpretation of round-trip latency.
 
 ---
 
