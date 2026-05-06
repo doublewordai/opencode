@@ -489,7 +489,52 @@ This is a strong signal that **the response shape coming back from the autobatch
 
 The same model that scored 17/24 + 7/7 Blocking + 20 inline comments in 4m 22s on phase 1 produced **zero useful output** on phase 2 in 20m 36s. The agent loop converged (46 messages = many tool turns) but the final assistant message was free-form prose rather than the JSON block the prompt required. With three model attempts (35B → empty XML, DeepSeek-Pro → 7-character "Network error" Chinese text, Qwen 397B → unstructured prose) all failing the same kind of format-following collapse, **the conclusion is that the autobatcher path materially perturbs model behavior across the board — not a per-model issue**. The wrapper architecture is sound; the inference path itself is broken for agent-loop workloads.
 
-**Phase 2 verdict:** the autobatcher path is unfit for client-side multi-step agentic workloads with current Doubleword infrastructure. It's not a configuration problem or a wrapper problem — same prompt, same harness, same model gives radically different (and useless) output through the autobatcher vs chat-completions. Worth a deeper investigation upstream into how the autobatcher's submit/poll/return cycle interacts with `tool_calls`, response format adherence, and the model's interpretation of round-trip latency.
+**Phase 2 verdict (initial):** the autobatcher path is unfit for client-side multi-step agentic workloads with current Doubleword infrastructure. It's not a configuration problem or a wrapper problem — same prompt, same harness, same model gives radically different (and useless) output through the autobatcher vs chat-completions. Worth a deeper investigation upstream into how the autobatcher's submit/poll/return cycle interacts with `tool_calls`, response format adherence, and the model's interpretation of round-trip latency.
+
+### Phase 2 — root-cause investigation: tool-call stream-emission bug in the fake-stream wrapper
+
+The "all four phase-2 model attempts produce different garbage" pattern was suspicious enough to dig into the request bodies directly via the prod DB. Connected to the prod Neon branch, joined `fusillade.batches` → `fusillade.requests` → `fusillade.request_templates`, and inspected what the autobatcher was actually sending to inference for our test runs. Smoking gun in the deepest 397B batch (49 messages):
+
+```
+idx | role      | shape
+----+-----------+---------------------------
+  1 | system    | content_len=26728
+  2 | user      | content_len=383
+  3 | assistant | content_len=3       ← just "\n\n"
+  4 | assistant | content_len=3
+  5 | assistant | content_len=3
+  ... (47 of 47 assistant turns: content_len=3, NO tool_calls, NO tool role messages)
+ 49 | assistant | content_len=3
+```
+
+Every batch in a phase-2 agent loop submitted a request body with the shape `[system, user, assistant(empty), assistant(empty), ...]`. **No `tool_calls` arrays on any assistant turn. No `tool` role messages with results.** And yet the *responses* coming back from inference contained `tool_calls: [2-3 items]` (verified by querying `fusillade.requests.response_body` for the same batches). So the model was correctly returning tool calls; the problem was that those tool calls were vanishing somewhere between response and the next request's body.
+
+**Root cause:** our fake-stream wrapper was emitting `LanguageModelV3ToolCall` StreamParts directly without the `tool-input-{start, delta, end}` preamble. Although the `LanguageModelV3StreamPart` union accepts a bare `tool-call` as a valid variant in its type definition, the **Vercel AI SDK's higher-level `streamText()` consumer requires the input ceremony to recognise a real tool call**. Without it, the SDK consumes the tool-call as malformed, stores the assistant turn as empty content, and never dispatches the tool. opencode therefore never runs the tool, never accumulates a `tool` role message with the result, and the agent loop restarts each turn with no grounding (just an ever-growing list of empty assistant placeholders) — which exactly matches what every model did:
+
+- **35B**: emitted `<invoke>` XML in `reasoning_content` because it kept seeing only system + user + empty turns and tried Anthropic-style tool invocation as a last resort
+- **DeepSeek-V4-Pro**: emitted `网络错误，正在重试...` ("Network error, retrying…") — the model interpreted the empty-context loop as a network failure
+- **Qwen 397B**: produced 49 turns of empty content + a final unstructured-prose attempt (no JSON block) — the model couldn't make progress on a task whose tool results never came back
+
+**Fix:** emit `tool-input-start` (with `toolName` + flags) → `tool-input-delta` (with the complete pre-existing JSON input as a single delta) → `tool-input-end` (closing) before pushing the actual `LanguageModelV3ToolCall`. Implemented in commit `experiment(phase-2): fix fake-stream tool-call emission (root cause of phase-2 collapse)` on `experiment/phase-2-autobatcher`.
+
+**Verified post-fix:** the latest phase-2 batch on prod shows 74 messages with proper alternation `[system, user, assistant(tool_calls=2), tool, tool, assistant(tool_calls=1), tool, ...]` — exactly the OpenAI chat-completions tool-use pattern, every `tool_call_id` correctly matched to its result. The agent loop converged on Qwen 397B in 10m 47s and produced 12 inline-formatted findings in JSON. Score against ground truth:
+
+| Metric | Phase 1 + Qwen 397B | Phase 2 + Qwen 397B (post-fix) |
+|---|---|---|
+| Direct hits | 14 / 24 (58%) | 8 / 24 (33%) |
+| Hits + partials | **17 / 24 (71%)** | **10 / 24 (42%)** |
+| Of 7 Blocking | **7 / 7 (100%)** | **6 / 7 (86%)** (missed B5: `host_user` exposure) |
+| False positives | 0 | 0 |
+| Bonus catches | 4 | 1 |
+| Inline comments parsed | 20 | 12 |
+| GitHub posting | Clean inline-anchored review | All 12 line-refs outside diff → GitHub `422` → summary-only fallback posted |
+| End-to-end latency | 4 min 22 s | 10 min 47 s (2.5×) |
+
+**Phase 2 verdict (revised):** the autobatcher path is *viable* for multi-step agent loops with the right wrapper — but at a real cost. Same model + same harness + same prompt costs ~7 ground-truth hits and ~2.5× latency on phase-2 vs phase-1. The model also lost file:line precision (every inline finding had a line number outside the diff, forcing summary-only fallback on GitHub). Both regressions trace to the autobatcher's added round-trip latency interfering with the model's working state across many turns. **Phase-2 friction-tally entries (additional)** added to the running list below.
+
+The root-cause investigation is itself a recordable piece of friction:
+
+- **Customer-side wrappers between agent SDKs and inference providers must replicate the SDK's exact internal protocol assumptions, even when the type-level contract suggests otherwise.** The `LanguageModelV3StreamPart` union explicitly lists `LanguageModelV3ToolCall` as a valid variant. A naive reading of the type signature says "you can emit a tool-call directly". The Vercel AI SDK *runtime* disagrees: it requires `tool-input-start`/`-delta`/`-end` events to *recognise* a tool call and dispatch it. The SDK silently discards bare tool-call StreamParts. **The customer can only discover this divergence between the type contract and runtime behaviour by reverse-engineering the SDK's internals or, as we did, inspecting the actual wire-level request bodies in production.** A platform-side tool loop owns the model→agent dispatch entirely — the customer never has to write a `LanguageModelV3` adapter, and discrepancies between the SDK's type system and runtime semantics never become customer-visible bugs.
 
 ---
 
