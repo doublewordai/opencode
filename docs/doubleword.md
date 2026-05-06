@@ -300,6 +300,40 @@ Frontend (`UserNotes.tsx`): F1 HIT (both XSS sites — `:46` and `:56` — flagg
 
 **Net read:** the inline-comment + research-heavy pattern produces a *visibly higher-quality* review per finding (grounded, not boilerplate, posted Copilot-style on the right lines) at the cost of a few subtle Non-blocking misses. For real-PR use, we'd take this trade. Phases 2–4 will compare *both* iterations against the same ground truth.
 
+### Phase 1 results — Copilot-pattern + async refactor + DeepSeek-V4-Pro
+
+To test the hypothesis that a more powerful model would catch more issues, we re-ran with `REVIEW_MODEL_ID=deepseek-ai/DeepSeek-V4-Pro` (revision `pr-review-harness-00014-55c`):
+
+| Metric | DeepSeek-Pro | DeepSeek-Flash | Qwen baseline |
+|---|---|---|---|
+| Direct hits | **6 / 24** (25%) | 11 / 24 (46%) | 13 / 24 (54%) |
+| Hits + partials | **13 / 24** (54%) | 15 / 24 (63%) | 16 / 24 (67%) |
+| Of the 7 Blocking-severity issues | **5 / 7** hit or partial (71%) | 6 / 7 (86%) | 6 / 7 (86%) |
+| False positives | 0 | 0 | 1 |
+| Bonus catches | **5** | 3 | 3 |
+| Inline comments posted | 15 | 16 | 0 (single summary) |
+| End-to-end latency | 354 s (5 min 54 s) | 124 s | 72 s |
+
+**Per-issue scoring** for Pro: B1 PARTIAL (summary general-findings flags "issues below become live if registered" but doesn't explicitly call out the missing auth extractor), B2 MISS, B3 HIT, B4 MISS (the `println!` line is flagged at `:23` but framed purely as observability/convention, not as the security leak it also is), B5 PARTIAL, B6 HIT, B7 MISS, B8 HIT (summary mentions "missing `tracing::instrument`"), B9 PARTIAL (severity upgraded to Blocking), B10 MISS, B11 MISS (Pro found a *bigger* issue at the same line — see bonus catches), B12 MISS, B13 HIT. **Backend: 4 hits + 3 partials + 6 misses out of 13.**
+
+Frontend: F1 HIT (both XSS sites), F2 HIT, F3 PARTIAL (severity upgraded), F4 PARTIAL (severity upgraded), F5 MISS, F6 MISS (Flash got this; Pro didn't), F7 PARTIAL (severity upgraded), F8 MISS, F9 MISS, F10 PARTIAL (inline `:41` flags a related stale-closure issue but a different angle from the "fresh function each render" framing in ground truth), F11 MISS. **Frontend: 2 hits + 4 partials + 5 misses out of 11.**
+
+**Bonus catches (5):**
+
+1. **`#![allow(dead_code)]` at module scope is too broad** — should be at item level for the specific function/struct that needs it. Real code-quality smell.
+2. **`uptime_seconds` semantic bug** — same as Flash and Qwen (different angle on B6's line).
+3. **`State<AppState>` is not generic over `PoolProvider`** — caught a *codebase-level convention violation* the ground truth missed entirely. Pro's prompt-driven grep found that every other handler is generic over `P: PoolProvider` ("136 occurrences across the handler modules") and that the planted handler doesn't follow this pattern. This is a strictly stronger finding than ground-truth B11 (which was the much weaker "`_state` parameter is unused" nit at the same line).
+4. **`debug_payload` field duplication** — same as Flash.
+5. **Stale-closure bug in `handleDelete`** — `setNotes((notes ?? []).filter(...))` captures `notes` from the render scope. If the notes list was updated between the render that created this closure and the user clicking Delete, the optimistic removal will work against stale state. Distinct from ground-truth F11 (rollback) and F10 (fresh-function GC) — caught a third correctness bug at the same site.
+
+**The unexpected result:** the more powerful model produced a *lower* ground-truth score and *took 3× longer*, while finding strictly *more architecturally sophisticated bonus issues*. Pro reads less like "lint everything that's wrong" and more like "spend deep thought on the most interesting line you find" — which is the wrong trade for a PR-gate review where you want comprehensive coverage of obvious issues. Pro:
+
+- Skipped surface-level issues like missing `#[utoipa::path(...)]` (B12), `localStorage` in component body (F8), `(d as any)` casts (F9), and no error handling on the data fetch (F6) — *all of which Flash caught*.
+- Went deep on the most-interesting line of the backend handler (the `PoolProvider` generic) and produced a finding stronger than anything in the ground truth.
+- Spent ~78s per agent turn (23 messages in 302s before the final write) — the same per-turn latency as Kimi but *did* converge in time, because of fewer total turns.
+
+For PR review specifically, **Flash is the better tool**: it's 3× faster, catches more easy issues, and still produces a strong Blocking-issue hit-rate (6/7 vs Pro's 5/7). Pro might be the right shape for *architecture review* or *design-doc review* where depth-over-breadth is the right trade — but for a per-PR gate, breadth-over-depth wins. **Net result: switching to a "more powerful" model did not produce a better review for this task — it produced a different and arguably worse one.**
+
 ---
 
 ## Production friction observed (running tally)
