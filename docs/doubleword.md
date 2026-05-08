@@ -619,6 +619,73 @@ Until then, **phase 4 is blocked on Doubleword-side schema work** and we report 
 
 Phase-4 friction-tally entry added to the running list below.
 
+### Phase 4 results — take 2: deserializer fixed, model now returns empty completions
+
+The executor's `MessageContent` schema gap from take 1 has been closed upstream — the request bodies the Vercel AI SDK serializes are now accepted at the executor's deserializer (verified by querying `fusillade.requests` directly: 13/13 of our take-2 requests have `service_tier=flex`, `model=Qwen/Qwen3.5-397B-A17B-FP8`, `path=/v1/responses`, and a 45 KB Responses-API request body with `input[]` (not `messages[]`), `tools` in the flat Responses-API form (`{type: "function", name, description, parameters}` — no nested `function` object), `service_tier: "flex"`, `background: true`). No 422 anywhere in the trace, no `MessageContent`-enum mismatch, no `missing field 'role'` complaint. **The schema gap from the previous run is closed.**
+
+Cloud Run revision `pr-review-harness-00031-mjw` was deployed from the take-2 phase-4 image (`harness:phase-4`, with the previous phase-2 transient-422-retry from `pr-review-shim` cherry-picked onto the phase-4 branch first; same Qwen 397B model as the current phase-2 deployment, no other change to harness, prompt, or wrapper). Trigger fired (PR #1047 close+reopen), opencode session created, first inference call submitted via the wrapper's `background=true` path.
+
+**Every single one of the 13 inference requests our agent loop made over 30 minutes failed identically. The wrapper's polling logic worked end-to-end — no SDK-side validator failures, no transport-level errors. The failure happens deep inside the executor.** Each request, after being accepted (status `queued`, then `in_progress`), eventually transitioned to the terminal status `failed` with this exact upstream body packaged as the error:
+
+```jsonc
+{
+  "id": "resp_5128df3c-…",
+  "object": "response",
+  "model": "Qwen/Qwen3.5-397B-A17B-FP8",
+  "background": true,
+  "status": "failed",
+  "output": [],
+  "error": {
+    "code": 400,
+    "type": "invalid_request_error",
+    "message": "{\"choices\":[],\"usage\":null}"
+  }
+}
+```
+
+Note the shape of `error.message`: it's a JSON-stringified `{"choices":[],"usage":null}` — a literal **empty chat-completions response body**. This is what's leaking out of the executor's internal forwarding to the model, wrapped one level out as a `400 invalid_request_error`. Our wrapper's terminal-failure-surfacing fix from take 1 correctly turns each of these into a 502 to the SDK; opencode's session loop sees 13 consecutive 502s, never gets a usable assistant turn, and the message count plateaus at `2` (system + user) for the entire 30-min budget. The shim then throws `opencode session ses_… did not complete within REVIEW_TIMEOUT_MS=1800000ms` and gives up.
+
+**Why this is a new failure mode (not a re-run of take 1):**
+
+- Take 1 failed at the executor's *body deserializer* — the Responses-API content shape didn't match the `MessageContent` enum.
+- Take 2 gets *past* the deserializer (the request body is accepted; `fusillade.requests.error` has no `MessageContent` mention; the request gets all the way to inference) and fails because the model's response is empty (`choices: []`, `usage: null`), which the executor then re-classifies as a `400 invalid_request_error`.
+
+So the take-2 failure is at a different boundary than take 1 — between the executor's *request normaliser* and the model serving the flex tier. Two plausible mechanisms (we did not bisect):
+
+1. **Tool-format conversion in the flex executor's chat-completions adapter is dropping or mangling the tools.** The Vercel AI SDK serializes tools in the Responses-API flat form (`{type: "function", name, description, parameters}`). For the model to actually use them via a chat-completions backend the executor has to convert to nested form (`{type: "function", function: {name, description, parameters}}`). If the conversion silently zero-tools-out the request, the model sees a system+user prompt that explicitly instructs it to use tools, can't make any tool call, and emits an empty completion to fail-closed.
+2. **The flex tier's per-request wrapping changes context shape in a way the model interprets as malformed.** Phase 2 already produced the cleanest evidence we have that "different inference tiers behave differently from the model's perspective" (DeepSeek-V4-Pro went from 13/24 hits on phase 1 to a 7-character `网络错误，正在重试…` Chinese-text response on phase 2's autobatcher path — same model, same prompt, different tier). Take-2 is the same kind of regression at a different tier: the model's response on flex+background+`Responses` collapses to empty, where the same model on realtime+`chat-completions` produced 17/24 hits + 20 inline comments + 7/7 Blocking.
+
+The empirical fact, regardless of cause: **same model, same prompt, same harness, same tools — different tier, zero usable output on every single attempt.** A platform-side tool loop owns the tier-routing decision and the request-shape conversion as a single internal concern; the customer never has to discover empirically which (model, tier, request-shape) triples produce useful output and which produce silent zero-output regressions.
+
+| Phase | Inference path | Take | Failure boundary | Result |
+|---|---|---|---|---|
+| 4 | Responses API + flex + background | take 1 | SDK serializer ↔ executor deserializer (`MessageContent` enum doesn't accept Responses-API content shapes) | 422 on every request |
+| 4 | Responses API + flex + background | take 2 | Executor request-normaliser ↔ model on flex tier (model returns `{"choices":[],"usage":null}`, executor wraps as 400 `invalid_request_error`) | empty completions on every request; agent loop stalls at 2 messages; 30-min timeout |
+
+### Phase 4 take 2 — operational outcome
+
+| Metric | Take 2 (Qwen 397B + flex + background) |
+|---|---|
+| Cloud Run revision | `pr-review-harness-00031-mjw` |
+| Image | `europe-west4-docker.pkg.dev/tech-426212/pr-review-harness/harness:phase-4` |
+| Inference requests submitted | 13 |
+| Requests completed | 0 |
+| Requests failed (terminal `failed`) | 13 / 13 (100%) |
+| Common error body | `{"choices":[],"usage":null}` packaged as `error.code=400, error.type=invalid_request_error` |
+| Agent-loop messages reached | 2 (system + user; never produced a single assistant turn) |
+| End-to-end outcome | shim timed out at `REVIEW_TIMEOUT_MS=1800000ms`; no review posted to PR |
+| Direct hits | 0 / 24 (0%) |
+| Hits + partials | 0 / 24 (0%) |
+
+### Take-aways for the experiment
+
+- The phase-4 422 schema gap was real and is now fixed upstream. Recording the fix here so the cross-phase summary tracks it.
+- The fix exposed a *new* failure that the original phase-4 take didn't get far enough to see. **Phase 4 has now failed at a different boundary in two consecutive runs against the same harness**, both of which are surfaces the customer is not in a position to fix.
+- The wrapper's terminal-failure-surfacing fix (added in take 1) earned its keep here: without it, take 2 would have presented as "opencode session produced an empty assistant message" with no upstream signal, and we'd be debugging in the wrong place. As a piece of customer-side friction this generalises: **any custom wrapper between an agent SDK and a multi-tier inference provider has to define and own its error-propagation contract, because nothing else in the stack will surface upstream failures coherently.**
+- The 13/13 uniform-failure pattern (same model × same flex+background path × every request fails identically) is the cleanest example yet of "the model's behaviour depends on the tier, not just the model" — the cross-phase headline finding the experiment is converging on.
+
+Phase-4 take-2 friction-tally entry added to the running list below.
+
 ---
 
 ## Production friction observed (running tally)
@@ -667,6 +734,11 @@ These are first-time-only mistakes, but each is a representative customer footgu
 
 - **Vercel-AI-SDK Responses-API request body doesn't deserialize on Doubleword's executor.** Phase 4's wrapper sidesteps the SDK ↔ tier mismatches that broke phases 2 and 3 — it owns the full fire-and-poll dance internally (`background=true`, `service_tier=flex`, poll `GET /v1/responses/<id>` every 2s until terminal, synthesize a single response for the SDK). That layer worked. But once the request actually reached Doubleword's model executor, every run failed identically with `HTTP 422 Unprocessable Entity: Failed to deserialize the JSON body into the target type: messages[1].content: data did not match any variant of untagged enum MessageContent`. Tested with both `Qwen/Qwen3.5-397B-A17B-FP8` and `deepseek-ai/DeepSeek-V4-Flash`. Not model-specific; the executor's `MessageContent` enum has variants for the chat-completions message shape (which phase 1 uses successfully) but not for the Responses-API request-body shape (the part types like `input_text`, `output_text`, and the tool-call/tool-result message content the Vercel AI SDK serialises). **A third structural failure at a third boundary** — at the customer's request-serializer ↔ provider's deserializer interface, which neither side owns and neither can independently fix. **Each phase failed at a different layer**: phase 2 at SDK ↔ provider library (streaming vs batching), phase 3 at SDK validator ↔ tier wire format (SSE deltas vs in-progress envelopes), phase 4 at SDK serializer ↔ executor deserializer (chat-completions content shape vs Responses-API content shape). Configurable around in theory but only by the customer writing yet more wrapper code against schemas they don't own and don't control. **A platform-side tool loop owns model selection, tier routing, and request/response normalisation as a single internal concern — none of these three boundaries would exist for the customer.** Unblocking phase 4 specifically requires Doubleword's executor to add the missing `MessageContent` variants for the Responses-API request body; once that lands we can run phase 4 properly and benchmark against the phase-1 baseline.
 - **Custom wrappers write their own error-propagation contracts (and get them wrong).** When phase 4 first failed, the wrapper synthesised a `200` response from *any* terminal status — including `failed`, `incomplete`, `cancelled`. The SDK parsed those as successful empty responses, opencode marked the assistant message complete-but-empty, and our shim's only signal was an uninformative *"no review text returned from opencode"* log. The actual upstream 422 was visible only in Doubleword-side logs we happened to have access to. Fixed by mapping non-`completed` terminal statuses to `502` with the failure body + a wrapper-side `console.error`. This is itself a recurring pattern of client-side-tool friction: every wrapper a customer writes to bridge a third-party-SDK ↔ third-party-API mismatch is also where the *error contract* gets defined; getting it wrong silently hides upstream failures. A platform-side tool loop has one error contract owned by Doubleword end-to-end.
+
+### Phase 4 take 2 (Open Responses API + flex + background, schema gap fixed) — additional friction
+
+- **Schema fix removed one boundary failure and uncovered a different one at the next layer.** After Doubleword's executor closed the `MessageContent` deserializer gap that broke take 1, take 2 redeployed the same wrapper + same harness + same Qwen 397B model from the current phase-2 deployment. **Every one of the 13 inference requests our agent loop made over the 30-minute budget terminated with `status=failed` and the upstream error body `{"choices":[],"usage":null}` packaged as a `400 invalid_request_error`** — i.e. the executor accepted our Responses-API request body, forwarded it to the model on flex, got an empty completion back from the model, and re-classified that empty completion as a 400. Same model on phase 1's chat-completions+realtime path scored 17/24 hits + 20 inline comments + 7/7 Blocking against the same PR. Same model on phase-4 flex+background returns *zero* tokens of output, deterministically, on every single call. The agent loop never produced an assistant turn (message count plateaued at 2 = system+user), the shim hit `REVIEW_TIMEOUT_MS=1800000ms`, and no review was posted. **This is the second consecutive phase-4 run that has failed at a different layer than the previous one, on customer surfaces the customer cannot fix.** Both failures are *only visible because tool execution lives client-side and the customer has to write the bridge between SDK and tier* — the executor's body-deserializer schema gap (take 1) and the model-empty-completion regression (take 2) are both internal concerns of the inference platform that have leaked into customer-visible behaviour because the customer is the one composing the SDK ↔ tier boundary. We did not bisect the take-2 root cause; the most plausible mechanisms are (a) the executor's flex-tier chat-completions adapter is dropping or mangling tools when converting from the Responses-API flat-tools form to the chat-completions nested-tools form (so the model sees a system+user prompt that demands tools, has none available, and emits empty), or (b) the flex tier's request-shape transformation is producing a chat-completions body the model interprets as malformed, similar to phase 2's already-documented "DeepSeek-Pro responds `网络错误`" pattern. **Either way, the cross-phase headline is now data-supported in two independent ways: the model's behaviour is a function of the (tier, request-shape) the customer routes it through, not just of the model itself.** A platform-side tool loop owns the routing-and-shape concerns as a single internal detail — the customer pins one model and one durable-step API, and gets the same observable behaviour regardless of which tier the platform happens to dispatch the call on.
+- **Empirical failure rate of identical requests is the only available diagnostic when upstream observability is partial.** To diagnose take 2 we had to query `fusillade.requests` directly on the prod Neon branch (joining `request_templates` for the request body, `requests` for the per-request error, and visually inspecting the JSON payload to confirm the body shape we were sending) — the customer-visible signal from the Vercel AI SDK + opencode session was just "13 consecutive 502s and a 30-min timeout". For a real customer who *doesn't* have prod-DB access (the ordinary case), this debugging path is closed. The customer is left with "every call fails" and no way to distinguish executor-deserializer-rejected from model-returned-empty from tier-shape-conversion-broken. **Customer-side debuggability of multi-tier inference paths is a load-bearing observability gap** — and one that a platform-side tool loop would absorb because the platform already has end-to-end visibility into the request lifecycle (which is what `response_step_id` analytics in dashboard, [COR-360](https://linear.app/doubleword/issue/COR-360), is meant to expose for the platform side).
 
 ---
 
