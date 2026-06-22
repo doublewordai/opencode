@@ -3,7 +3,7 @@
   "provider": {
     "doubleword": {
       "npm": "file:///app/doubleword-async-wrapper/index.js",
-      "name": "Doubleword (async/flex)",
+      "name": "Doubleword (flex chat-completions)",
       "env": ["DOUBLEWORD_API_KEY"],
       "options": {
         "baseURL": "https://api.doubleword.ai/v1",

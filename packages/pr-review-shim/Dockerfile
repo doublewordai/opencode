@@ -45,8 +45,10 @@ COPY packages/pr-review-shim/dist/pr-review-shim-linux-x64-musl/bin/pr-review-sh
 COPY opencode.json /app/opencode.json
 COPY docs/doubleword.md /app/docs/doubleword.md
 
-# Phase-2: pre-built single-file ESM bundle of @doubleword/vercel-ai with
-# createDoublewordAsync re-exported as createDoubleword. opencode.json's
+# Flex via chat-completions: pre-built single-file ESM bundle that wraps
+# @ai-sdk/openai-compatible (the same transport phase 1 validated) and injects
+# `service_tier: "flex"` into every /chat/completions request body, while
+# keeping native streaming. Exports createDoubleword. opencode.json's
 # provider.doubleword.npm points at file:///app/doubleword-async-wrapper/index.js
 # so the dynamic-import path in opencode picks this up directly (no Npm.add).
 COPY packages/doubleword-async-wrapper/dist/index.js /app/doubleword-async-wrapper/index.js
