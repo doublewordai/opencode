@@ -1,28 +1,37 @@
-// Phase-2 wrapper, take 2: chat-completions through Doubleword's autobatcher
-// (createDoublewordAsync — 1h flex tier) with a fake-streaming shim layered on
-// top so opencode's streamText() calls succeed.
+// Flex via chat-completions + fake-streaming shim.
 //
-// The original phase-2 wrapper just re-exported `createDoublewordAsync` as
-// `createDoubleword`. opencode's agent loop uses streamText; the autobatcher
-// rejects streaming with "Streaming is not supported in batch mode. Use
-// generateText() instead of streamText()." (See docs/doubleword.md "Phase 2
-// results — autobatcher" for the original failure write-up.)
+// Two facts drive this design:
 //
-// This wrapper replaces the re-export with a LanguageModelV3 shim that:
-//   - Delegates doGenerate() unchanged to the autobatcher's underlying model
-//   - Implements doStream() by calling doGenerate() and emitting the result
-//     as a single synthetic stream — text content as start/delta/end triplets,
-//     tool-call / tool-result / file / source / tool-approval-request as
-//     pass-through stream parts (the LanguageModelV3StreamPart union accepts
-//     these types directly), and a final 'finish' event with usage + reason.
+//   1. Doubleword's flex tier IS reachable on the standard
+//      /v1/chat/completions endpoint by setting `service_tier: "flex"` in the
+//      request body — it returns a normal, synchronous, well-formed
+//      chat.completion object (tool_calls included). No batch submit/poll, no
+//      async in-progress envelope. This is the clean content shape phase 1
+//      validated.
 //
-// This is a polite lie: opencode thinks it's getting a real stream, but the
-// underlying provider returns the entire response in one batch. For an agent
-// loop where each turn is one model call followed by tool execution, that's
-// fine — the stream just emits one big chunk and ends. For UX where token-
-// by-token streaming matters, this shim defeats the point.
+//   2. BUT the flex tier silently ignores `stream: true`. A streaming request
+//      to flex comes back as a single buffered `application/json`
+//      chat.completion (Content-Type application/json, object
+//      "chat.completion") instead of an SSE stream of chat.completion.chunk
+//      frames. opencode's agent loop always calls streamText(), so the
+//      @ai-sdk/openai-compatible stream parser issues stream:true, gets a
+//      non-SSE blob back, and fails — producing an empty assistant message
+//      ("no review text returned from opencode").
+//
+// So we use @ai-sdk/openai-compatible against chat-completions (injecting
+// service_tier=flex via a wrapped fetch) for the clean content shape, and
+// layer a LanguageModelV3 shim that turns doStream() into doGenerate() — the
+// NON-streaming path, which flex handles correctly — then re-emits the single
+// result as a synthetic stream so opencode's streamText() is satisfied.
+//
+// This is the same fake-stream shim shape the autobatcher attempt used, but
+// over a fundamentally healthier transport: chat-completions (phase-1 content
+// shape) instead of the batch submit/poll dance that perturbed model
+// behaviour. The only cost vs phase 1 is flex-tier per-call latency and the
+// loss of token-by-token streaming — irrelevant for a bot that posts a single
+// final review.
 
-import { createDoublewordAsync } from "@doubleword/vercel-ai";
+import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type {
   LanguageModelV3,
   LanguageModelV3CallOptions,
@@ -32,48 +41,78 @@ import type {
   LanguageModelV3ToolCall,
 } from "@ai-sdk/provider";
 
-interface CreateDoublewordOptions {
+export interface CreateDoublewordOptions {
+  name?: string;
   apiKey?: string;
   baseURL?: string;
   headers?: Record<string, string>;
-  batchSize?: number;
-  batchWindowSeconds?: number;
-  pollIntervalSeconds?: number;
-  completionWindow?: string;
+  // Tier to request on every chat-completions call. Defaults to "flex".
+  // Override to "default"/"priority" to A/B against the realtime baseline
+  // without rebuilding the transport.
+  serviceTier?: string;
 }
 
 export function createDoubleword(opts: CreateDoublewordOptions = {}) {
-  // Pin completionWindow="1h" explicitly. createDoublewordAsync forwards
-  // options.completionWindow through to autobatcher's AsyncOpenAI (see
-  // @doubleword/vercel-ai dist/index.js:359). When this is undefined, the
-  // underlying AsyncOpenAI client defaults to the 24h batch tier — not the
-  // 1h flex tier the README documents. We want the 1h flex tier here, so
-  // override explicitly. (Upstream bug to follow up on with the
-  // @doubleword/vercel-ai maintainers.)
-  //
-  // batchSize=1 + batchWindowSeconds=1 eliminate the autobatcher's sequential-
-  // loop overhead. opencode's agent loop is strictly sequential (each turn
-  // waits for the previous turn's tool result), so there are never multiple
-  // concurrent calls to batch together — the default batchWindowSeconds=10
-  // would just add 10s of dead waiting per turn. Submitting immediately
-  // (batchSize=1, batchWindowSeconds=1) makes the autobatcher behave like a
-  // pass-through to the flex/async tier.
-  const inner = createDoublewordAsync({
-    completionWindow: "1h",
-    batchSize: 1,
-    batchWindowSeconds: 1,
-    ...opts,
+  const serviceTier = opts.serviceTier ?? "flex";
+
+  // Inject service_tier into chat-completions request bodies. The shim below
+  // only ever issues non-streaming (doGenerate) calls, so we never send a
+  // stream:true request to flex — sidestepping the buffered-JSON-vs-SSE
+  // mismatch entirely.
+  const wrappedFetch: typeof fetch = async (input, init) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : (input as Request).url;
+
+    const isChatCompletionsPost =
+      init?.method === "POST" && url.includes("/chat/completions");
+
+    if (
+      !isChatCompletionsPost ||
+      !init?.body ||
+      typeof init.body !== "string"
+    ) {
+      return fetch(input as RequestInfo, init);
+    }
+
+    let body: any;
+    try {
+      body = JSON.parse(init.body);
+    } catch {
+      return fetch(input as RequestInfo, init);
+    }
+
+    body.service_tier = serviceTier;
+
+    return fetch(input as RequestInfo, {
+      ...init,
+      body: JSON.stringify(body),
+    });
+  };
+
+  const provider = createOpenAICompatible({
+    name: opts.name ?? "doubleword",
+    baseURL: opts.baseURL ?? "https://api.doubleword.ai/v1",
+    apiKey: opts.apiKey,
+    headers: opts.headers,
+    fetch: wrappedFetch,
   });
 
-  const wrapModel = (modelId: string) => fakeStream(inner.languageModel(modelId));
+  const wrapModel = (modelId: string) => fakeStream(provider.chatModel(modelId));
 
-  const provider: any = (modelId: string) => wrapModel(modelId);
-  provider.languageModel = wrapModel;
-  provider.chatModel = wrapModel;
-  provider.embeddingModel = (id: string) => inner.embeddingModel(id);
-  provider.textEmbeddingModel = (id: string) => inner.textEmbeddingModel(id);
-  provider.close = () => inner.close();
-  return provider;
+  // opencode's provider loader calls `.languageModel(id)`; expose both names
+  // plus the embedding accessors so the loader finds whichever it asks for.
+  const wrapper: any = (modelId: string) => wrapModel(modelId);
+  wrapper.languageModel = wrapModel;
+  wrapper.chatModel = wrapModel;
+  wrapper.textEmbeddingModel = (modelId: string) =>
+    provider.textEmbeddingModel(modelId);
+  wrapper.embeddingModel = (modelId: string) =>
+    provider.textEmbeddingModel(modelId);
+  return wrapper;
 }
 
 function fakeStream(inner: LanguageModelV3): LanguageModelV3 {
@@ -139,10 +178,9 @@ function generateResultToStreamParts(
         // the SDK consumes it as an empty-content assistant turn and never
         // dispatches the tool — causing opencode to never see a tool to
         // execute, never accumulate a tool-result message, and effectively
-        // restart the agent loop with no grounding on every turn. This was
-        // the root cause of phase-2's three-different-model failures (see
-        // docs/doubleword.md "Phase 2 results — take 2"). Emit the full
-        // start/delta/end sequence with the complete pre-existing input
+        // restart the agent loop with no grounding on every turn. (See
+        // docs/doubleword.md "Phase 2 — root-cause investigation".) Emit the
+        // full start/delta/end sequence with the complete pre-existing input
         // serialised as a single delta, then pass the actual tool-call
         // through unchanged.
         const tc = c as LanguageModelV3ToolCall;
